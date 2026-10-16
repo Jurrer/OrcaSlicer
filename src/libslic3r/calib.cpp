@@ -21,9 +21,63 @@
 #include <cstddef>
 #include <memory>
 #include <utility>
+#include <locale>
 #include "clonable_ptr.hpp"
 
 namespace Slic3r {
+
+std::optional<double> flow_ratio_calibration_print_flow_ratio(const ModelObject &object, double filament_flow_ratio, bool linear)
+{
+    const std::string &object_name = object.name;
+    if (!std::isfinite(filament_flow_ratio) || filament_flow_ratio <= 0.0 || object_name.size() <= 9 || object_name.compare(0, 9, "flowrate_") != 0)
+        return std::nullopt;
+
+    std::string modifier = object_name.substr(9);
+    if (!modifier.empty() && modifier.front() == 'm')
+        modifier.front() = '-';
+
+    std::istringstream stream(modifier);
+    stream.imbue(std::locale::classic());
+    double modifier_value = 0.0;
+    if (!(stream >> modifier_value) || stream.peek() != std::char_traits<char>::eof())
+        return std::nullopt;
+
+    if (linear)
+        return (filament_flow_ratio + modifier_value) / filament_flow_ratio;
+
+    return 1.0 + modifier_value / 100.0;
+}
+
+std::pair<int, int> batch_temperature_tower_defaults(const std::string &filament_type)
+{
+    if (filament_type == "ABS" || filament_type == "ASA")
+        return {270, 230};
+    if (filament_type == "PETG")
+        return {250, 230};
+    if (filament_type == "PCTG")
+        return {280, 240};
+    if (filament_type == "TPU")
+        return {240, 210};
+    if (filament_type == "PA-CF" || filament_type == "PET-CF")
+        return {320, 280};
+    return {230, 190};
+}
+
+bool valid_batch_temperature_tower(int start_temperature, int end_temperature)
+{
+    return start_temperature <= 500 && end_temperature >= 155 && start_temperature > end_temperature;
+}
+
+bool batch_nozzle_diameters_match(const std::vector<double> &nozzle_diameters)
+{
+    if (nozzle_diameters.empty())
+        return false;
+
+    const double first_nozzle_diameter = nozzle_diameters.front();
+    return std::all_of(nozzle_diameters.begin(), nozzle_diameters.end(), [first_nozzle_diameter](double nozzle_diameter) {
+        return std::isfinite(nozzle_diameter) && nozzle_diameter > 0.0 && std::abs(nozzle_diameter - first_nozzle_diameter) < EPSILON;
+    });
+}
 
 // Calculate the optimal Pressure Advance speed
 float CalibPressureAdvance::find_optimal_PA_speed(const DynamicPrintConfig &config, double line_width, double layer_height, int extruder_id, int filament_idx)

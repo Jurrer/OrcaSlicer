@@ -18,6 +18,8 @@
 #include "slic3r/GUI/Widgets/RadioGroup.hpp"
 #include "slic3r/GUI/Widgets/TextInput.hpp"
 #include "libslic3r/calib.hpp"
+#include "libslic3r/Preset.hpp"
+#include "libslic3r/PresetBundle.hpp"
 #include "libslic3r/libslic3r.h"
 #include "slic3r/GUI/Widgets/ComboBox.hpp"
 #include <boost/filesystem/path.hpp>
@@ -1884,6 +1886,224 @@ void FlowRateCalibrationDialog::on_start(wxCommandEvent& event) {
 }
 
 void FlowRateCalibrationDialog::on_dpi_changed(const wxRect& suggested_rect) {
+    this->Refresh();
+}
+
+BatchCalibrationDialog::BatchCalibrationDialog(wxWindow* parent, wxWindowID id, Plater* plater)
+    : DPIDialog(parent, id, _L("Batch Calibration"), wxDefaultPosition, wxDefaultSize, wxDEFAULT_DIALOG_STYLE),
+      m_plater(plater)
+{
+    SetBackgroundColour(*wxWHITE);
+    SetForegroundColour(wxColour("#363636"));
+    SetFont(Label::Body_14);
+
+    auto v_sizer = new wxBoxSizer(wxVERTICAL);
+
+    auto filament_box = new LabeledStaticBox(this, _L("Loaded filaments"));
+    auto filament_sizer = new wxStaticBoxSizer(filament_box, wxVERTICAL);
+    filament_sizer->AddSpacer(FromDIP(5));
+    const auto* preset_bundle = wxGetApp().preset_bundle;
+    const auto full_config = preset_bundle->full_config();
+    const auto* flow_ratios = full_config.option<ConfigOptionFloatsNullable>("filament_flow_ratio");
+    const size_t filament_count = flow_ratios == nullptr ? 0 :
+        std::min(preset_bundle->filament_presets.size(), flow_ratios->values.size());
+    for (size_t extruder = 0; extruder < filament_count; ++extruder) {
+        const double flow_ratio = flow_ratios->get_at(static_cast<int>(extruder));
+        wxString label = wxString::Format(_L("Filament %d"), static_cast<int>(extruder + 1));
+        const Preset* preset = preset_bundle->filaments.find_preset(preset_bundle->filament_presets[extruder], false);
+        const bool flow_usable = preset != nullptr && std::isfinite(flow_ratio) && flow_ratio > 0.0;
+        std::string filament_type;
+        bool temperature_usable = false;
+        if (preset != nullptr) {
+            if (const auto* filament_types = preset->config.option<ConfigOptionStrings>("filament_type"); filament_types != nullptr)
+                filament_type = filament_types->get_at(0);
+            if (const auto* nozzle_temperatures = preset->config.option<ConfigOptionInts>("nozzle_temperature"); nozzle_temperatures != nullptr)
+                temperature_usable = nozzle_temperatures->get_at(0) > 0;
+            label += " - " + wxString::FromUTF8(preset->name);
+        }
+        if (flow_usable)
+            label += wxString::Format(_L(" (Flow ratio: %.3f)"), flow_ratio);
+        const auto [start_temperature, end_temperature] = batch_temperature_tower_defaults(filament_type);
+
+        auto checkbox = new ::CheckBox(this);
+        auto filament_row = new wxBoxSizer(wxHORIZONTAL);
+        filament_row->Add(checkbox, 0, wxLEFT | wxBOTTOM | wxALIGN_CENTER_VERTICAL, FromDIP(3));
+        auto label_text = new Label(this, label);
+        filament_row->Add(label_text, 0, wxLEFT | wxBOTTOM | wxALIGN_CENTER_VERTICAL, FromDIP(8));
+        auto start_input = new TextInput(this, std::to_string(start_temperature), _L("\u2103" /* °C */), "", wxDefaultPosition, FromDIP(wxSize(75, -1)));
+        auto end_input = new TextInput(this, std::to_string(end_temperature), _L("\u2103" /* °C */), "", wxDefaultPosition, FromDIP(wxSize(75, -1)));
+        filament_row->Add(start_input, 0, wxLEFT | wxBOTTOM | wxALIGN_CENTER_VERTICAL, FromDIP(6));
+        filament_row->Add(end_input, 0, wxLEFT | wxBOTTOM | wxALIGN_CENTER_VERTICAL, FromDIP(6));
+        filament_sizer->Add(filament_row, 0, wxLEFT | wxBOTTOM, FromDIP(3));
+        m_filament_rows.push_back({
+            checkbox,
+            start_input,
+            end_input,
+            static_cast<int>(extruder),
+            flow_usable,
+            temperature_usable,
+        });
+    }
+    v_sizer->Add(filament_sizer, 0, wxTOP | wxRIGHT | wxLEFT | wxEXPAND, FromDIP(10));
+
+    auto test_type_box = new LabeledStaticBox(this, _L("Test type"));
+    auto test_type_sizer = new wxStaticBoxSizer(test_type_box, wxVERTICAL);
+    m_rbTestType = new RadioGroup(this, { _L("Flow Ratio"), _L("Temperature Tower") }, wxVERTICAL, 1);
+    m_rbTestType->SetSelection(0);
+    test_type_sizer->Add(m_rbTestType, 0, wxALL, FromDIP(4));
+    v_sizer->Add(test_type_sizer, 0, wxTOP | wxRIGHT | wxLEFT | wxEXPAND, FromDIP(10));
+
+    auto type_box = new LabeledStaticBox(this, _L("Flow Ratio variant"));
+    auto type_sizer = new wxStaticBoxSizer(type_box, wxVERTICAL);
+    m_rbType = new RadioGroup(this, { _L("Pass 1"), _L("Pass 2"), _L("YOLO Linear"), _L("YOLO Fine") }, wxVERTICAL, 1);
+    m_rbType->SetSelection(0);
+    type_sizer->Add(m_rbType, 0, wxALL, FromDIP(4));
+    v_sizer->Add(type_sizer, 0, wxTOP | wxRIGHT | wxLEFT | wxEXPAND, FromDIP(10));
+
+    auto settings_box = new LabeledStaticBox(this, _L("Settings"));
+    auto settings_sizer = new wxStaticBoxSizer(settings_box, wxVERTICAL);
+    settings_sizer->AddSpacer(FromDIP(5));
+    auto pattern_sizer = new wxBoxSizer(wxHORIZONTAL);
+        auto pattern_text = new Label(this, _L("Top Surface Pattern"), wxALIGN_LEFT, FromDIP(wxSize(120, -1)));
+    m_rbPattern = new ComboBox(this, wxID_ANY, wxEmptyString, wxDefaultPosition, FromDIP(wxSize(120, -1)), 0, nullptr, wxCB_READONLY);
+    m_rbPattern->Append(_L("Archimedean Chords"));
+    m_rbPattern->Append(_L("Monotonic"));
+    m_rbPattern->SetSelection(0);
+    pattern_sizer->Add(pattern_text, 0, wxALL | wxALIGN_CENTER_VERTICAL, FromDIP(2));
+    pattern_sizer->Add(m_rbPattern, 0, wxALL | wxALIGN_CENTER_VERTICAL, FromDIP(2));
+    settings_sizer->Add(pattern_sizer, 0, wxALL, FromDIP(2));
+    m_cbResize = add_scale_checkbox(this, settings_sizer);
+    v_sizer->Add(settings_sizer, 0, wxTOP | wxRIGHT | wxLEFT | wxEXPAND, FromDIP(10));
+
+    auto sequence_note = new Label(this,
+        _L("Generated batches print one filament at a time using By Object. "
+           "Changing the project to By Layer removes that isolation; physical print order is not tied to selection or layout order."));
+    sequence_note->SetToolTip(_L("By Object is required for one-filament-at-a-time calibration isolation."));
+    v_sizer->Add(sequence_note, 0, wxTOP | wxRIGHT | wxLEFT | wxEXPAND, FromDIP(10));
+
+    auto dlg_btns = new DialogButtons(this, {"OK"});
+    dlg_btns->GetOK()->Bind(wxEVT_BUTTON, &BatchCalibrationDialog::on_start, this);
+    v_sizer->AddSpacer(FromDIP(8));
+    v_sizer->Add(dlg_btns, 0, wxEXPAND);
+
+    SetSizerAndFit(v_sizer);
+    m_rbTestType->Bind(wxEVT_COMMAND_RADIOBOX_SELECTED, [this](wxCommandEvent& event) {
+        on_test_type_changed(event);
+    });
+    m_cbResize->Disable();
+    for (const BatchFilamentRow& row : m_filament_rows) {
+        row.start_temperature->Disable();
+        row.end_temperature->Disable();
+    }
+    update_filament_availability();
+    wxGetApp().UpdateDlgDarkUI(this);
+}
+
+void BatchCalibrationDialog::on_start(wxCommandEvent& event)
+{
+    std::vector<int> selected_extruders;
+    for (const BatchFilamentRow& row : m_filament_rows) {
+        if (row.check->GetValue())
+            selected_extruders.push_back(row.extruder);
+    }
+    std::sort(selected_extruders.begin(), selected_extruders.end());
+
+    if (selected_extruders.empty()) {
+        MessageDialog msg_dlg(this, _L("Please select at least one filament."), wxEmptyString, wxICON_WARNING | wxOK);
+        msg_dlg.ShowModal();
+        return;
+    }
+
+    if (m_rbTestType->GetSelection() == 1) {
+        std::vector<Calib_Params> tower_params;
+        tower_params.reserve(selected_extruders.size());
+        for (const int selected_extruder : selected_extruders) {
+            long start_temperature = 0;
+            long end_temperature = 0;
+            for (const BatchFilamentRow& row : m_filament_rows) {
+                if (row.extruder != selected_extruder)
+                    continue;
+                row.start_temperature->GetTextCtrl()->GetValue().ToLong(&start_temperature);
+                row.end_temperature->GetTextCtrl()->GetValue().ToLong(&end_temperature);
+            }
+
+            Calib_Params params;
+            params.mode = CalibMode::Calib_Temp_Tower;
+            params.extruder_id = selected_extruder;
+            params.start = start_temperature;
+            params.end = end_temperature;
+            params.nozzle_based_resize = m_cbResize->GetValue();
+            tower_params.push_back(params);
+        }
+
+        wxString error_message;
+        if (!m_plater->calib_batch_temperature(tower_params, error_message)) {
+            if (!error_message.empty()) {
+                MessageDialog msg_dlg(this, error_message, wxEmptyString, wxICON_WARNING | wxOK);
+                msg_dlg.ShowModal();
+            }
+            return;
+        }
+
+        EndModal(wxID_OK);
+        event.Skip();
+        return;
+    }
+
+    const int type = m_rbType->GetSelection();
+    const int pattern_idx = m_rbPattern->GetSelection();
+    InfillPattern pattern = pattern_idx == 1 ? ipMonotonic : ipArchimedeanChords;
+    const bool is_linear = type >= 2;
+    const int pass = (type % 2) + 1;
+
+    wxString error_message;
+    if (!m_plater->calib_batch_flowrate(selected_extruders, is_linear, pass, pattern, error_message)) {
+        if (!error_message.empty()) {
+            MessageDialog msg_dlg(this, error_message, wxEmptyString, wxICON_WARNING | wxOK);
+            msg_dlg.ShowModal();
+        }
+        return;
+    }
+
+    EndModal(wxID_OK);
+    event.Skip();
+}
+
+void BatchCalibrationDialog::on_test_type_changed(wxCommandEvent& event)
+{
+    const bool temperature_tower = m_rbTestType->GetSelection() == 1;
+    m_rbType->Enable(!temperature_tower);
+    m_rbPattern->Enable(!temperature_tower);
+    m_cbResize->Enable(temperature_tower);
+    for (const BatchFilamentRow& row : m_filament_rows) {
+        row.start_temperature->Enable(temperature_tower);
+        row.end_temperature->Enable(temperature_tower);
+    }
+    update_filament_availability();
+    event.Skip();
+}
+
+void BatchCalibrationDialog::update_filament_availability()
+{
+    const bool temperature_tower = m_rbTestType->GetSelection() == 1;
+    for (BatchFilamentRow& row : m_filament_rows) {
+        const bool usable = temperature_tower ? row.temperature_usable : row.flow_usable;
+        row.check->Enable(usable);
+        if (!usable)
+            row.check->SetValue(false);
+        if (!usable)
+            row.check->SetToolTip(temperature_tower ?
+                _L("This filament has no usable Temperature Tower settings.") :
+                _L("This filament has no usable Flow ratio."));
+        else
+            row.check->UnsetToolTip();
+    }
+}
+
+void BatchCalibrationDialog::on_dpi_changed(const wxRect& suggested_rect)
+{
+    Layout();
+    Fit();
     this->Refresh();
 }
 

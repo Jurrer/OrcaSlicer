@@ -3570,6 +3570,11 @@ void MainFrame::init_menubar_as_editor()
         [this](wxCommandEvent&) { run_calibration(CalibKind::FlowRatio); }, "", nullptr,
         [this]() {return m_plater->is_view3D_shown();; }, this);
 
+    // Batch calibration
+    append_menu_item(m_topbar->GetCalibMenu(), wxID_ANY, _L("Batch Calibration"), _L("Batch Calibration"),
+        [this](wxCommandEvent&) { run_calibration(CalibKind::BatchCalibration); }, "", nullptr,
+        [this]() {return m_plater->is_view3D_shown();; }, this);
+
     // Retraction
     append_menu_item(m_topbar->GetCalibMenu(), wxID_ANY, _L("Retraction"), _L("Retraction"),
         [this](wxCommandEvent&) { run_calibration(CalibKind::Retraction); }, "", nullptr,
@@ -3674,6 +3679,11 @@ void MainFrame::init_menubar_as_editor()
     // ORCA: Flow rate (Wizard Dialog)
     append_menu_item(calib_menu, wxID_ANY, _L("Flow ratio"), _L("Flow Rate Calibration"),
         [this](wxCommandEvent&) { run_calibration(CalibKind::FlowRatio); }, "", nullptr,
+        [this]() {return m_plater->is_view3D_shown();; }, this);
+
+    // Batch calibration
+    append_menu_item(calib_menu, wxID_ANY, _L("Batch Calibration"), _L("Batch Calibration"),
+        [this](wxCommandEvent&) { run_calibration(CalibKind::BatchCalibration); }, "", nullptr,
         [this]() {return m_plater->is_view3D_shown();; }, this);
 
     // Retraction
@@ -4574,6 +4584,13 @@ void MainFrame::technology_changed()
 void MainFrame::run_calibration(CalibKind calib_kind)
 {
     switch (calib_kind) {
+    case CalibKind::BatchCalibration: {
+        if (!m_plater)
+            break;
+        BatchCalibrationDialog dialog((wxWindow*) this, wxID_ANY, m_plater);
+        dialog.ShowModal();
+        break;
+    }
     case CalibKind::Temperature: {
         if (!m_temp_calib_dlg)
             m_temp_calib_dlg = new Temp_Calibration_Dlg((wxWindow*) this, wxID_ANY, m_plater);

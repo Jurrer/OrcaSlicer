@@ -132,6 +132,7 @@ protected:
 // Calibration wizard identity, shared by MainFrame::run_calibration and the Speed Dial command runners.
 enum class CalibKind : int
 { 
+    BatchCalibration,
     Temperature, 
     MaxVolumetric, 
     PressureAdvance, 

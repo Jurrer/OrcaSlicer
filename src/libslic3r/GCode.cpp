@@ -6190,6 +6190,7 @@ LayerResult GCode::process_layer(
         layer_ptr = support_layer;
     const Layer& layer = *layer_ptr;
     m_cur_layer_idx = layer.id();
+    m_current_print_object = layer.object();
     // A per-layer nozzle grouping can move the active filament to another variant column on a
     // layer boundary without a toolchange, so re-resolve the writer's config column here.
     if (Extruder *cur_filament = m_writer.filament())
@@ -6354,6 +6355,8 @@ LayerResult GCode::process_layer(
     // down first with the correct tool.  See the emit_belt_brim_for_extruder call.
 
     //Calibration Layer-specific GCode
+    const Calib_Params& current_calib_params = this->current_calib_params();
+
     // ORCA-Belt: on belt printers the calibration object is counter-rotated to
     // stand upright in slicing space on top of a support wedge, so its first
     // layer starts above Z=0 (at its position along the belt) with support-only
@@ -6361,7 +6364,7 @@ LayerResult GCode::process_layer(
     // of the object so they keep their designed meaning; on regular printers
     // the object base is at Z=0 and calib_z == print_z.
     double calib_z = print_z;
-    if (m_config.belt_printer.value && print.calib_mode() != CalibMode::Calib_None) {
+    if (m_config.belt_printer.value && current_calib_params.mode != CalibMode::Calib_None) {
         // Skip empty ghost layers the grid may produce below the object.
         for (const Layer* l : layer.object()->layers())
             if (!l->lslices.empty()) {
@@ -6369,11 +6372,11 @@ LayerResult GCode::process_layer(
                 break;
             }
     }
-    switch (print.calib_mode()) {
+    switch (current_calib_params.mode) {
         case CalibMode::Calib_PA_Tower: {
-            gcode += writer().set_pressure_advance(this->interpolate_value_across_layers(static_cast<float>(print.calib_params().start),
-                                                                                         static_cast<float>(print.calib_params().end),
-                                                                                         static_cast<float>(print.calib_params().step)));
+            gcode += writer().set_pressure_advance(this->interpolate_value_across_layers(static_cast<float>(current_calib_params.start),
+                                                                                         static_cast<float>(current_calib_params.end),
+                                                                                         static_cast<float>(current_calib_params.step)));
             break;
         }
         case CalibMode::Calib_Temp_Tower: {
@@ -6387,7 +6390,9 @@ LayerResult GCode::process_layer(
                 sectioned_temp > 0) {
                 gcode += writer().set_temperature(static_cast<unsigned int>(sectioned_temp));
             } else {
-                gcode += writer().set_temperature(this->interpolate_value_across_layers(static_cast<float>(print.calib_params().start), static_cast<float>(print.calib_params().end), 5.0f));
+            gcode += writer().set_temperature(this->interpolate_value_across_print_object_layers(static_cast<float>(current_calib_params.start),
+                                                                                                 static_cast<float>(current_calib_params.end),
+                                                                                                 5.0f));
             }
             break;
         }
@@ -6395,19 +6400,19 @@ LayerResult GCode::process_layer(
             // Step the outer wall speed from start to end across the tower's layers. Plater::calib_VFA sizes the
             // geometry so each speed step spans one visual block (a fixed number of layers), so the layer-based
             // stepping stays aligned with the blocks regardless of nozzle size / layer height.
-            float _speed = this->interpolate_value_across_layers(static_cast<float>(print.calib_params().start),
-                                                                 static_cast<float>(print.calib_params().end),
-                                                                 static_cast<float>(print.calib_params().step));
+            float _speed = this->interpolate_value_across_layers(static_cast<float>(current_calib_params.start),
+                                                                 static_cast<float>(current_calib_params.end),
+                                                                 static_cast<float>(current_calib_params.step));
             m_calib_config.set_key_value("outer_wall_speed", new ConfigOptionFloatsNullable({std::round(_speed)}));
             break;
         }
         case CalibMode::Calib_Vol_speed_Tower: {
-            auto _speed = print.calib_params().start + std::max(0.0, calib_z) * print.calib_params().step;
+            auto _speed = current_calib_params.start + std::max(0.0, calib_z) * current_calib_params.step;
             m_calib_config.set_key_value("outer_wall_speed", new ConfigOptionFloatsNullable({std::round(_speed)}));
             break;
         }
         case CalibMode::Calib_Retraction_tower: {
-            auto _length = print.calib_params().start + std::floor(std::max(0.0,calib_z-0.4)) * print.calib_params().step;
+            auto _length = current_calib_params.start + std::floor(std::max(0.0,calib_z-0.4)) * current_calib_params.step;
             DynamicConfig _cfg;
             _cfg.set_key_value("retraction_length", new ConfigOptionFloats{_length});
             writer().config.apply(_cfg);
@@ -6417,17 +6422,17 @@ LayerResult GCode::process_layer(
         }
         case CalibMode::Calib_Input_shaping_freq: {
             if (m_layer_index == 1){
-                gcode += writer().set_input_shaping('A', print.calib_params().start, 0.f, print.calib_params().shaper_type);
+                gcode += writer().set_input_shaping('A', current_calib_params.start, 0.f, current_calib_params.shaper_type);
                 if (m_writer.get_gcode_flavor() == gcfKlipper) {
                     // Disable minimum cruise ratio to ensure consistent motion for calibration
                     gcode += "SET_VELOCITY_LIMIT MINIMUM_CRUISE_RATIO=0\n";
                 }
             } else {
-                if (print.calib_params().freqStartX == print.calib_params().freqStartY && print.calib_params().freqEndX == print.calib_params().freqEndY) {
-                    gcode += writer().set_input_shaping('A', 0.f, this->interpolate_value_across_layers(print.calib_params().freqStartX, print.calib_params().freqEndX), "");
+                if (current_calib_params.freqStartX == current_calib_params.freqStartY && current_calib_params.freqEndX == current_calib_params.freqEndY) {
+                    gcode += writer().set_input_shaping('A', 0.f, this->interpolate_value_across_layers(current_calib_params.freqStartX, current_calib_params.freqEndX), "");
                 } else {
-                    gcode += writer().set_input_shaping('X', 0.f, this->interpolate_value_across_layers(print.calib_params().freqStartX, print.calib_params().freqEndX), "");
-                    gcode += writer().set_input_shaping('Y', 0.f, this->interpolate_value_across_layers(print.calib_params().freqStartY, print.calib_params().freqEndY), "");
+                    gcode += writer().set_input_shaping('X', 0.f, this->interpolate_value_across_layers(current_calib_params.freqStartX, current_calib_params.freqEndX), "");
+                    gcode += writer().set_input_shaping('Y', 0.f, this->interpolate_value_across_layers(current_calib_params.freqStartY, current_calib_params.freqEndY), "");
                 }
             }
             break;
@@ -6438,10 +6443,10 @@ LayerResult GCode::process_layer(
                     // Disable minimum cruise ratio to ensure consistent motion for calibration
                     gcode += "SET_VELOCITY_LIMIT MINIMUM_CRUISE_RATIO=0\n";
                 }
-                gcode += writer().set_input_shaping('X', 0.f, print.calib_params().freqStartX, print.calib_params().shaper_type);
-                gcode += writer().set_input_shaping('Y', 0.f, print.calib_params().freqStartY, print.calib_params().shaper_type);
+                gcode += writer().set_input_shaping('X', 0.f, current_calib_params.freqStartX, current_calib_params.shaper_type);
+                gcode += writer().set_input_shaping('Y', 0.f, current_calib_params.freqStartY, current_calib_params.shaper_type);
             } else {
-                gcode += writer().set_input_shaping('A', this->interpolate_value_across_layers(print.calib_params().start, print.calib_params().end), 0.f, "");
+                gcode += writer().set_input_shaping('A', this->interpolate_value_across_layers(current_calib_params.start, current_calib_params.end), 0.f, "");
             }
             break;
         }
@@ -6449,9 +6454,9 @@ LayerResult GCode::process_layer(
             if (m_writer.get_gcode_flavor() == gcfMarlinFirmware &&
                 !m_config.machine_max_junction_deviation.values.empty() &&
                 m_config.machine_max_junction_deviation.values.front() > 0) {
-                gcode += writer().set_junction_deviation(this->interpolate_value_across_layers(print.calib_params().start, print.calib_params().end));
+                gcode += writer().set_junction_deviation(this->interpolate_value_across_layers(current_calib_params.start, current_calib_params.end));
             } else {
-                gcode += writer().set_jerk_xy(this->interpolate_value_across_layers(print.calib_params().start, print.calib_params().end));
+                gcode += writer().set_jerk_xy(this->interpolate_value_across_layers(current_calib_params.start, current_calib_params.end));
             }
             break;
         }
@@ -8396,6 +8401,14 @@ std::string GCode::extrude_entity(const ExtrusionEntity&                     ent
     return "";
 }
 
+const Calib_Params& GCode::current_calib_params() const
+{
+    assert(m_curr_print != nullptr);
+    if (m_current_print_object == nullptr)
+        return m_curr_print->calib_params();
+    return m_curr_print->calib_params(*m_current_print_object->model_object());
+}
+
 std::string GCode::extrude_path(const ExtrusionPath& path, const std::string& description, double speed)
 {
     // Orca: Reset average multipath flow as this is a single line, single extrude volumetric speed path
@@ -9738,30 +9751,29 @@ std::string GCode::extrusion_role_to_string_for_parser(const ExtrusionRole & rol
     }
 }
 
-// Calculate the interpolated value for the current layer between start_value and end_value.
-// Step > 0 splits the range into equal-width bands from first to last value (both inclusive).
-// Step = 0 means gradual interpolation finishing at last value.
-float GCode::interpolate_value_across_layers(float start_value, float end_value, float step) const
+static float interpolate_value_across_layers_at(float start_value, float end_value, float step,
+                                                int layer_index, int layer_count, bool belt_printer,
+                                                const Layer* layer)
 {
     float ratio;
     // ORCA-Belt: counter-rotated calibration objects stand on a support wedge,
     // so support-only layers below the object would stretch a layer-index
     // interpolation. Use the object's own Z span instead, so the value ramps
     // across the test geometry only.
-    if (m_config.belt_printer.value && m_layer != nullptr && !m_layer->object()->layers().empty()) {
-        const auto& layers = m_layer->object()->layers();
+    if (belt_printer && layer != nullptr && !layer->object()->layers().empty()) {
+        const auto& layers = layer->object()->layers();
         // Skip empty ghost layers the grid may produce below the object.
         double z_min = layers.front()->print_z;
         for (const Layer* l : layers)
             if (!l->lslices.empty()) { z_min = l->print_z; break; }
         const double z_max = layers.back()->print_z;
-        if (m_layer->print_z <= z_min + EPSILON || z_max - z_min <= EPSILON)
+        if (layer->print_z <= z_min + EPSILON || z_max - z_min <= EPSILON)
             return start_value;
-        ratio = float(std::min(1.0, (m_layer->print_z - z_min) / (z_max - z_min)));
-    } else if (m_layer_index <= 1) {
+        ratio = float(std::min(1.0, (layer->print_z - z_min) / (z_max - z_min)));
+    } else if (layer_index <= 1) {
         return start_value;
     } else {
-        ratio = m_layer_index / (m_layer_count - 1.f);
+        ratio = layer_index / (layer_count - 1.f);
     }
     if (step > 0.f) {
         // Discrete equal-width bands. band is clamped to the last band so the result can't overshoot the range:
@@ -9771,6 +9783,23 @@ float GCode::interpolate_value_across_layers(float start_value, float end_value,
         return start_value + (end_value >= start_value ? 1.f : -1.f) * band * step;
     }
     return start_value + ratio * (end_value - start_value);
+}
+
+// Calculate the interpolated value for the current layer between start_value and end_value.
+// Step > 0 splits the range into equal-width bands from first to last value (both inclusive).
+// Step = 0 means gradual interpolation finishing at last value.
+float GCode::interpolate_value_across_layers(float start_value, float end_value, float step) const
+{
+    return interpolate_value_across_layers_at(start_value, end_value, step, m_layer_index, m_layer_count,
+                                              m_config.belt_printer.value, m_layer);
+}
+
+float GCode::interpolate_value_across_print_object_layers(float start_value, float end_value, float step) const
+{
+    assert(m_current_print_object != nullptr);
+    return interpolate_value_across_layers_at(start_value, end_value, step, m_cur_layer_idx,
+                                              static_cast<int>(m_current_print_object->layer_count()),
+                                              m_config.belt_printer.value, m_layer);
 }
 
 std::string encodeBase64(uint64_t value)

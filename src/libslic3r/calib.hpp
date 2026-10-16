@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <string>
 #include <vector>
+#include <optional>
 #include <utility>
 #include <memory>
 #define calib_pressure_advance_dd
@@ -69,6 +70,11 @@ enum FlowRatioCalibrationType {
     COMPLETE_CALIBRATION = 0,
     FINE_CALIBRATION,
 };
+
+std::optional<double> flow_ratio_calibration_print_flow_ratio(const ModelObject &object, double filament_flow_ratio, bool linear);
+std::pair<int, int> batch_temperature_tower_defaults(const std::string &filament_type);
+bool valid_batch_temperature_tower(int start_temperature, int end_temperature);
+bool batch_nozzle_diameters_match(const std::vector<double> &nozzle_diameters);
 
 class X1CCalibInfos
 {

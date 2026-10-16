@@ -289,6 +289,7 @@ public:
     // Step will create equal layers steps from first to last value.
     // Step = 0 means gradual interpolation finishing at last value.
     float interpolate_value_across_layers(float start_value, float end_value, float step = 0.0f) const;
+    float interpolate_value_across_print_object_layers(float start_value, float end_value, float step = 0.0f) const;
 
     // For Perl bindings, to be used exclusively by unit tests.
     unsigned int    layer_count() const { return m_layer_count; }
@@ -631,6 +632,7 @@ protected:
     std::string     extrude_perimeters(const Print& print, const std::vector<ObjectByExtruder::Island::Region>& by_region, bool is_first_layer, bool is_infill_first, bool unsupported_loops_only = false);
     std::string     extrude_infill(const Print& print, const std::vector<ObjectByExtruder::Island::Region>& by_region, bool ironing);
     std::string     extrude_support(const ExtrusionEntityCollection& support_fills, const ExtrusionRole support_extrusion_role);
+    const Calib_Params& current_calib_params() const;
 
     // Farthest-point timelapse: find the extrusion point farthest from camera (0,0)
     void compute_farthest_point(const std::vector<LayerToPrint> &layers, int most_used_extruder,
@@ -869,6 +871,7 @@ protected:
 
     // BBS
     Print* m_curr_print = nullptr;
+    const PrintObject* m_current_print_object = nullptr;
     unsigned int m_toolchange_count;
     coordf_t m_nominal_z;
     // Mixed-color sublayer state. Non-zero only while emitting a mixed slot's sub-layer:

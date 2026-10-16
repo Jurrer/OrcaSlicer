@@ -403,6 +403,8 @@ public:
     void calib_pa(const Calib_Params& params);
     //ORCA: Add pattern parameter to calib_flowrate
     void calib_flowrate(bool is_linear, int pass, InfillPattern pattern = ipArchimedeanChords);
+    bool calib_batch_flowrate(const std::vector<int>& extruders, bool is_linear, int pass, InfillPattern pattern, wxString& error_message);
+    bool calib_batch_temperature(const std::vector<Calib_Params>& tower_params, wxString& error_message);
     void calib_temp(const Calib_Params& params);
     void calib_max_vol_speed(const Calib_Params& params);
     void calib_retraction(const Calib_Params& params);
@@ -561,7 +563,7 @@ public:
     void merge(size_t obj_idx, std::vector<int> &vol_indeces);
 
     void send_to_printer(bool isall = false);
-    void export_gcode(bool prefer_removable);
+    void export_gcode(bool prefer_removable, const wxString& default_filename = wxEmptyString);
     void export_gcode_3mf(bool export_all = false);
     void send_gcode_finish(wxString name);
     void export_core_3mf();

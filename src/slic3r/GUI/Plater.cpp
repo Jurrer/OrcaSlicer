@@ -47,6 +47,7 @@
 #include "libslic3r/Format/OBJ.hpp"
 #include "libslic3r/Geometry.hpp"
 #include "libslic3r/Arrange.hpp"
+#include "libslic3r/ModelArrange.hpp"
 #include "libslic3r/MultiNozzleUtils.hpp"
 #include "libslic3r/Color.hpp"
 #include <miniz.h>
@@ -16938,7 +16939,8 @@ void Plater::_calib_pa_select_added_objects() {
 // Adjust settings for flowrate calibration
 // For linear mode, pass 1 means normal version while pass 2 mean "for perfectionists" version
 // ORCA: Add pattern parameter
-void adjust_settings_for_flowrate_calib(ModelObjectPtrs& objects, bool linear, int pass, InfillPattern pattern)
+void adjust_settings_for_flowrate_calib(ModelObjectPtrs& objects, bool linear, int pass, InfillPattern pattern,
+    const std::map<const ModelObject*, double>* filament_flow_ratios = nullptr)
 {
     auto print_config = &wxGetApp().preset_bundle->prints.get_edited_preset().config;
     auto printer_config  = &wxGetApp().preset_bundle->printers.get_edited_preset().config;
@@ -16973,12 +16975,19 @@ void adjust_settings_for_flowrate_calib(ModelObjectPtrs& objects, bool linear, i
     }
     canvas->do_scale("");
 
-    auto cur_flowrate = filament_config->option<ConfigOptionFloats>("filament_flow_ratio")->get_at(0); // TODO: per-filament param
+    const double default_flowrate = filament_config->option<ConfigOptionFloats>("filament_flow_ratio")->get_at(0);
     std::vector<double> internal_solid_speeds = generate_max_speed_parameter_value("internal_solid_infill_speed", linear, pass);
     std::vector<double> top_surface_speeds = generate_max_speed_parameter_value("top_surface_speed", linear, pass);
 
     // adjust parameters
     for (auto _obj : objects) {
+        double current_flowrate = default_flowrate;
+        if (filament_flow_ratios) {
+            const auto filament_flow_ratio = filament_flow_ratios->find(_obj);
+            if (filament_flow_ratio == filament_flow_ratios->end() || !std::isfinite(filament_flow_ratio->second) || filament_flow_ratio->second <= 0.0)
+                continue;
+            current_flowrate = filament_flow_ratio->second;
+        }
         _obj->ensure_on_bed();
         _obj->config.set_key_value("wall_loops", new ConfigOptionInt(1));
         _obj->config.set_key_value("only_one_wall_top", new ConfigOptionBool(true));
@@ -17037,10 +17046,9 @@ void adjust_settings_for_flowrate_calib(ModelObjectPtrs& objects, bool linear, i
         // restore locale
         std::setlocale(LC_NUMERIC, _loc.c_str());
 
-        if(linear)
-            _obj->config.set_key_value("print_flow_ratio", new ConfigOptionFloat((cur_flowrate + modifier)/cur_flowrate));
-        else
-            _obj->config.set_key_value("print_flow_ratio", new ConfigOptionFloat(1.0f + modifier/100.f));
+        const auto print_flow_ratio = flow_ratio_calibration_print_flow_ratio(*_obj, current_flowrate, linear);
+        if (print_flow_ratio)
+            _obj->config.set_key_value("print_flow_ratio", new ConfigOptionFloat(*print_flow_ratio));
 
     }
 
@@ -17100,6 +17108,267 @@ void Plater::calib_flowrate(bool is_linear, int pass, InfillPattern pattern) {
     // Refresh object after scaling
     const std::vector<size_t> object_idx(boost::counting_iterator<size_t>(0), boost::counting_iterator<size_t>(model().objects.size()));
     changed_objects(object_idx);
+}
+
+static bool arrange_batch_calibration_objects(Model& model)
+{
+    if (model.objects.empty())
+        return true;
+
+    const auto full_config = wxGetApp().preset_bundle->full_config();
+    arrangement::ArrangePolygons selected;
+    std::vector<ModelInstance*> instances;
+    selected.reserve(model.objects.size());
+    instances.reserve(model.objects.size());
+
+    for (ModelObject* object : model.objects) {
+        if (object->instances.empty())
+            continue;
+
+        arrangement::ArrangePolygon arrange_polygon = get_instance_arrange_poly(object->instances.front(), full_config);
+        arrange_polygon.bed_idx = 0;
+        arrange_polygon.itemid = static_cast<int>(selected.size());
+        selected.emplace_back(std::move(arrange_polygon));
+        instances.emplace_back(object->instances.front());
+    }
+
+    if (selected.empty())
+        return true;
+
+    arrangement::ArrangeParams params = init_arrange_params(wxGetApp().plater());
+    params.is_seq_print = true;
+    params.bed_shrink_x = BED_SHRINK_SEQ_PRINT;
+    params.bed_shrink_y = BED_SHRINK_SEQ_PRINT;
+    update_arrange_params(params, &full_config, selected);
+    update_selected_items_inflation(selected, &full_config, params);
+    const Points bed_points = get_shrink_bedpts(&full_config, params);
+    arrangement::arrange(selected, bed_points, params);
+
+    for (const arrangement::ArrangePolygon& arrange_polygon : selected) {
+        if (arrange_polygon.bed_idx != 0)
+            return false;
+    }
+
+    for (size_t item_idx = 0; item_idx < selected.size(); ++item_idx) {
+        instances[item_idx]->apply_arrange_result(selected[item_idx].translation.cast<double>(), selected[item_idx].rotation);
+        instances[item_idx]->arrange_order = selected[item_idx].itemid;
+    }
+
+    return true;
+}
+
+static const Preset* batch_selected_filament_preset(const PresetBundle& preset_bundle, int extruder)
+{
+    if (extruder < 0 || extruder >= static_cast<int>(preset_bundle.filament_presets.size()))
+        return nullptr;
+    return preset_bundle.filaments.find_preset(preset_bundle.filament_presets[extruder], false);
+}
+
+static bool begin_batch_calibration_project(const wxString& project_name)
+{
+    Plater* plater = wxGetApp().plater();
+    if (plater->new_project(false, false, project_name) == wxID_CANCEL)
+        return false;
+
+    auto& print_config = wxGetApp().preset_bundle->prints.get_edited_preset().config;
+    print_config.set_key_value("print_sequence", new ConfigOptionEnum<PrintSequence>(PrintSequence::ByObject));
+    print_config.set_key_value("enable_prime_tower", new ConfigOptionBool(false));
+    plater->get_partplate_list().get_curr_plate()->set_print_seq(PrintSequence::ByObject);
+    wxGetApp().mainframe->select_tab(TAB_ID_PREPARE);
+    return true;
+}
+
+static bool finish_batch_calibration(Plater& plater, Model& model, const wxString& output_name, wxString& error_message)
+{
+    if (!arrange_batch_calibration_objects(model)) {
+        error_message = _L("The batch does not fit on one plate with the current sequential print clearance. "
+                           "Reduce the batch, reduce object sizes, or increase the printable area.");
+        return false;
+    }
+
+    const std::vector<size_t> object_indices(
+        boost::counting_iterator<size_t>(0), boost::counting_iterator<size_t>(model.objects.size()));
+    plater.changed_objects(object_indices);
+    plater.export_gcode(false, output_name);
+    return true;
+}
+
+bool Plater::calib_batch_flowrate(const std::vector<int>& extruders, bool is_linear, int pass, InfillPattern pattern, wxString& error_message)
+{
+    error_message.Clear();
+    if (extruders.empty()) {
+        error_message = _L("Please select at least one filament.");
+        return false;
+    }
+    if (pass != 1 && pass != 2) {
+        error_message = _L("Please select a Flow Ratio calibration variant.");
+        return false;
+    }
+
+    const auto full_config = wxGetApp().preset_bundle->full_config();
+    const PresetBundle* preset_bundle = wxGetApp().preset_bundle;
+    const auto *flow_ratios = full_config.option<ConfigOptionFloatsNullable>("filament_flow_ratio");
+    if (flow_ratios == nullptr || preset_bundle->filament_presets.empty()) {
+        error_message = _L("No filament profile is loaded.");
+        return false;
+    }
+    for (const int extruder : extruders) {
+        const double flow_ratio = extruder < 0 || extruder >= static_cast<int>(flow_ratios->values.size()) ? 0.0 :
+            flow_ratios->get_at(extruder);
+        if (batch_selected_filament_preset(*preset_bundle, extruder) == nullptr ||
+            !std::isfinite(flow_ratio) || flow_ratio <= 0.0) {
+            error_message = _L("Please select usable filaments only.");
+            return false;
+        }
+    }
+
+    if (!begin_batch_calibration_project(_L("Batch Flow Ratio Calibration")))
+        return false;
+
+    boost::filesystem::path model_path = boost::filesystem::path(Slic3r::resources_dir()) / "calib" / "filament_flow";
+    if (is_linear)
+        model_path /= (pass == 1 ? "Orca-LinearFlow.3mf" : "Orca-LinearFlow_fine.3mf");
+    else
+        model_path /= (pass == 1 ? "flowrate-test-pass1.3mf" : "flowrate-test-pass2.3mf");
+
+    std::map<const ModelObject*, double> group_flow_ratios;
+    for (const int extruder : extruders) {
+        const size_t first_object = model().objects.size();
+        if (!add_model(false, model_path.string())) {
+            error_message = _L("Failed to load the Flow Ratio calibration model.");
+            return false;
+        }
+
+        const double filament_flow_ratio = flow_ratios->get_at(extruder);
+        for (size_t object_idx = first_object; object_idx < model().objects.size(); ++object_idx) {
+            ModelObject* object = model().objects[object_idx];
+            object->config.set("extruder", extruder + 1);
+            group_flow_ratios.emplace(object, filament_flow_ratio);
+        }
+
+        adjust_settings_for_flowrate_calib(model().objects, is_linear, pass, pattern, &group_flow_ratios);
+        for (size_t object_idx = first_object; object_idx < model().objects.size(); ++object_idx) {
+            ModelObject* object = model().objects[object_idx];
+            object->name = "Batch Flow Ratio E" + std::to_string(extruder + 1) + " " + object->name;
+        }
+    }
+
+    wxGetApp().get_tab(Preset::TYPE_PRINTER)->reload_config();
+    wxGetApp().preset_bundle->printers.get_edited_preset().config.set_key_value("resonance_avoidance", new ConfigOptionBool{false});
+    return finish_batch_calibration(*this, model(), _L("Batch Flow Ratio Calibration"), error_message);
+}
+
+bool Plater::calib_batch_temperature(const std::vector<Calib_Params>& tower_params, wxString& error_message)
+{
+    error_message.Clear();
+    if (tower_params.empty()) {
+        error_message = _L("Please select at least one filament.");
+        return false;
+    }
+
+    const auto full_config = wxGetApp().preset_bundle->full_config();
+    const PresetBundle* preset_bundle = wxGetApp().preset_bundle;
+    const auto* nozzle_diameters = full_config.option<ConfigOptionFloats>("nozzle_diameter");
+    const auto* nozzle_temperatures = full_config.option<ConfigOptionInts>("nozzle_temperature");
+    if (nozzle_diameters == nullptr || nozzle_temperatures == nullptr) {
+        error_message = _L("No printer profile is loaded.");
+        return false;
+    }
+    if (preset_bundle->filament_presets.empty()) {
+        error_message = _L("No filament profile is loaded.");
+        return false;
+    }
+
+    std::vector<double> selected_nozzle_diameters;
+    selected_nozzle_diameters.reserve(tower_params.size());
+    for (const Calib_Params& params : tower_params) {
+        if (params.mode != CalibMode::Calib_Temp_Tower || batch_selected_filament_preset(*preset_bundle, params.extruder_id) == nullptr ||
+            params.extruder_id >= static_cast<int>(nozzle_diameters->values.size()) || nozzle_diameters->get_at(params.extruder_id) <= 0.0 ||
+            params.extruder_id >= static_cast<int>(nozzle_temperatures->values.size()) ||
+            nozzle_temperatures->get_at(params.extruder_id) <= 0 ||
+            !valid_batch_temperature_tower(static_cast<int>(params.start), static_cast<int>(params.end))) {
+            error_message = _L("Please select valid filaments and Temperature Tower settings.");
+            return false;
+        }
+        selected_nozzle_diameters.push_back(nozzle_diameters->get_at(params.extruder_id));
+    }
+    if (!batch_nozzle_diameters_match(selected_nozzle_diameters)) {
+        error_message = _L("Please select filaments with the same nozzle diameter.");
+        return false;
+    }
+
+    if (!begin_batch_calibration_project(_L("Batch Temperature Tower Calibration")))
+        return false;
+
+    auto* printer_config = &wxGetApp().preset_bundle->printers.get_edited_preset().config;
+    auto* print_config = &wxGetApp().preset_bundle->prints.get_edited_preset().config;
+    if (!add_model(false, Slic3r::resources_dir() + "/calib/temperature_tower/temperature_tower.drc")) {
+        error_message = _L("Failed to load the Temperature Tower calibration model.");
+        return false;
+    }
+
+    const double nozzle_diameter = selected_nozzle_diameters.front();
+    const double nozzle_scale = nozzle_diameter / 0.4;
+
+    for (const Calib_Params& params : tower_params) {
+        const size_t object_idx = model().objects.size() - 1;
+        ModelObject* object = model().objects[object_idx];
+        object->name = "Batch Temperature Tower E" + std::to_string(params.extruder_id + 1);
+        object->config.set("extruder", params.extruder_id + 1);
+
+        auto block_count = lround((500 - params.end) / 5 + 1);
+        double new_height = block_count * 10.0 - EPSILON;
+        if (new_height < object->bounding_box_exact().size().z())
+            cut_horizontal(object_idx, 0, new_height, ModelObjectCutAttribute::KeepLower);
+
+        object = model().objects[object_idx];
+        block_count = lround((500 - params.start) / 5);
+        new_height = block_count * 10.0 + EPSILON;
+        if (new_height < object->bounding_box_exact().size().z())
+            cut_horizontal(object_idx, 0, new_height, ModelObjectCutAttribute::KeepUpper);
+
+        object = model().objects[object_idx];
+        if (params.nozzle_based_resize && std::abs(nozzle_scale - 1.0) > EPSILON)
+            object->scale(nozzle_scale, nozzle_scale, nozzle_scale);
+        object->ensure_on_bed();
+
+        object->config.set_key_value("brim_type", new ConfigOptionEnum<BrimType>(btOuterOnly));
+        object->config.set_key_value("brim_width", new ConfigOptionFloat(5.0));
+        object->config.set_key_value("brim_object_gap", new ConfigOptionFloat(0.0));
+        object->config.set_key_value("alternate_extra_wall", new ConfigOptionBool(false));
+        object->config.set_key_value("seam_slope_type", new ConfigOptionEnum<SeamScarfType>(SeamScarfType::None));
+        object->config.set_key_value("overhang_reverse", new ConfigOptionBool(false));
+        object->config.set_key_value("precise_z_height", new ConfigOptionBool(false));
+        if (params.nozzle_based_resize)
+            object->config.set_key_value("layer_height", new ConfigOptionFloat(nozzle_diameter / 2));
+
+        if (object_idx + 1 < tower_params.size()) {
+            if (!add_model(false, Slic3r::resources_dir() + "/calib/temperature_tower/temperature_tower.drc")) {
+                error_message = _L("Failed to load the Temperature Tower calibration model.");
+                return false;
+            }
+        }
+    }
+
+    printer_config->set_key_value("resonance_avoidance", new ConfigOptionBool{false});
+    print_config->set_key_value("enable_wrapping_detection", new ConfigOptionBool(false));
+    if (tower_params.front().nozzle_based_resize)
+        print_config->set_key_value("initial_layer_print_height", new ConfigOptionFloat(nozzle_diameter / 2));
+
+    wxGetApp().get_tab(Preset::TYPE_PRINT)->update_dirty();
+    wxGetApp().get_tab(Preset::TYPE_PRINT)->reload_config();
+
+    Calib_Params global_params;
+    global_params.mode = CalibMode::Calib_Temp_Tower;
+    global_params.nozzle_based_resize = tower_params.front().nozzle_based_resize;
+    auto* print = p->background_process.fff_print();
+    print->set_calib_params(global_params);
+    print->clear_object_calib_params();
+    for (size_t tower_idx = 0; tower_idx < tower_params.size(); ++tower_idx) {
+        print->set_object_calib_params(*model().objects[tower_idx], tower_params[tower_idx]);
+    }
+
+    return finish_batch_calibration(*this, model(), _L("Batch Temperature Tower Calibration"), error_message);
 }
 
 
@@ -19129,7 +19398,7 @@ void Plater::apply_cut_object_to_model(size_t obj_idx, const ModelObjectPtrs& ne
     // w.wait_for_idle();
 }
 
-void Plater::export_gcode(bool prefer_removable)
+void Plater::export_gcode(bool prefer_removable, const wxString& default_filename)
 {
     if (p->model.objects.empty())
         return;
@@ -19158,6 +19427,10 @@ void Plater::export_gcode(bool prefer_removable)
     } catch (const std::exception &ex) {
         show_error(this, ex.what(), false);
         return;
+    }
+    if (!default_filename.empty()) {
+        default_output_file = into_path(default_filename);
+        default_output_file.replace_extension(".gcode");
     }
     default_output_file = fs::path(Slic3r::fold_utf8_to_ascii(default_output_file.string()));
     AppConfig 				&appconfig 				 = *wxGetApp().app_config;

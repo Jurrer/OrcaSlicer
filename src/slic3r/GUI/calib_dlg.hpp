@@ -19,6 +19,7 @@
 #include <wx/radiobox.h>
 #include <wx/sizer.h>
 #include "libslic3r/calib.hpp"
+#include <vector>
 
 namespace Slic3r { namespace GUI {
 
@@ -204,6 +205,36 @@ protected:
     RadioGroup* m_rbType;
     // ORCA: use standard OrcaSlicer ComboBox instead of BitmapComboBox
     ComboBox* m_rbPattern;
+    Plater* m_plater;
+};
+
+class BatchCalibrationDialog : public DPIDialog
+{
+public:
+    BatchCalibrationDialog(wxWindow* parent, wxWindowID id, Plater* plater);
+    void on_dpi_changed(const wxRect& suggested_rect) override;
+
+protected:
+    virtual void on_start(wxCommandEvent& event);
+    virtual void on_test_type_changed(wxCommandEvent& event);
+
+private:
+    struct BatchFilamentRow {
+        ::CheckBox* check;
+        TextInput* start_temperature;
+        TextInput* end_temperature;
+        int extruder;
+        bool flow_usable;
+        bool temperature_usable;
+    };
+
+    void update_filament_availability();
+
+    RadioGroup* m_rbTestType;
+    RadioGroup* m_rbType;
+    ComboBox* m_rbPattern;
+    CheckBox* m_cbResize;
+    std::vector<BatchFilamentRow> m_filament_rows;
     Plater* m_plater;
 };
 }} // namespace Slic3r::GUI

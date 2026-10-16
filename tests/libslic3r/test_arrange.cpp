@@ -427,3 +427,39 @@ TEST_CASE("Layered printing does not floor the object distance", "[Arrange]")
     update_selected_items_inflation(items, &cfg, p);
     CHECK(p.min_obj_distance == 0);
 }
+
+TEST_CASE("Sequential arrangement fails two large items on geometry rather than count", "[Arrange]")
+{
+    ArrangePolygons    items = squares(2, 120., NOZZLE_HEIGHT_MM / 2);
+    DynamicPrintConfig cfg    = bed_config();
+    ArrangeParams      p      = seq_print_params(0);
+    p.clearance_height_to_rod = float(NOZZLE_HEIGHT_MM * 2);
+    p.clearance_height_to_lid = float(NOZZLE_HEIGHT_MM * 2);
+
+    for (ArrangePolygon& item : items)
+        item.extrude_ids = {1};
+    update_arrange_params(p, &cfg, items);
+    update_selected_items_inflation(items, &cfg, p);
+    arrange(items, get_shrink_bedpts(&cfg, p), p);
+
+    REQUIRE(items[0].bed_idx != items[1].bed_idx);
+}
+
+TEST_CASE("Sequential arrangement keeps a fitting batch on the physical bed", "[Arrange]")
+{
+    ArrangePolygons    items = squares(20, 2., NOZZLE_HEIGHT_MM / 2);
+    DynamicPrintConfig cfg    = bed_config();
+    ArrangeParams      p      = seq_print_params(0);
+    p.clearance_height_to_rod = float(NOZZLE_HEIGHT_MM);
+    p.clearance_height_to_lid = float(NOZZLE_HEIGHT_MM);
+
+    for (ArrangePolygon& item : items)
+        item.extrude_ids = {1};
+    update_arrange_params(p, &cfg, items);
+    update_selected_items_inflation(items, &cfg, p);
+    arrange(items, get_shrink_bedpts(&cfg, p), p);
+
+    for (const ArrangePolygon &ap : items)
+        REQUIRE(ap.bed_idx == 0);
+    require_no_overlap(items);
+}

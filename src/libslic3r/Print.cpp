@@ -543,6 +543,22 @@ void Print::set_calib_params(const Calib_Params& params) {
     m_calib_params.mode = params.mode;
 }
 
+void Print::set_object_calib_params(const ModelObject& object, const Calib_Params& params)
+{
+    m_object_calib_params[object.id()] = params;
+}
+
+void Print::clear_object_calib_params()
+{
+    m_object_calib_params.clear();
+}
+
+const Calib_Params& Print::calib_params(const ModelObject& object) const
+{
+    const auto it = m_object_calib_params.find(object.id());
+    return it == m_object_calib_params.end() ? m_calib_params : it->second;
+}
+
 bool Print::invalidate_step(PrintStep step)
 {
 	bool invalidated = Inherited::invalidate_step(step);

@@ -1326,7 +1326,10 @@ public:
     CalibMode& calib_mode() { return m_calib_params.mode; }
     const CalibMode calib_mode() const { return m_calib_params.mode; }
     void set_calib_params(const Calib_Params& params);
+    void set_object_calib_params(const ModelObject& object, const Calib_Params& params);
+    void clear_object_calib_params();
     const Calib_Params& calib_params() const { return m_calib_params; }
+    const Calib_Params& calib_params(const ModelObject& object) const;
     Vec2d translate_to_print_space(const Vec2d &point) const;
     // Orca: precise counterpart of compacted_wipe_tower_clearance_valid(), run once the tower exists.
     void                validate_compacted_wipe_tower_clearance() const;
@@ -1549,7 +1552,8 @@ private:
     std::vector<std::set<int>> m_geometric_unprintable_filaments;
 
     //SoftFever: calibration
-    Calib_Params m_calib_params;
+    Calib_Params                     m_calib_params;
+    std::map<ObjectID, Calib_Params>  m_object_calib_params;
 
     bool m_need_check_multi_filaments_compatibility{true};
 
