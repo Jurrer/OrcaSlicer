@@ -175,9 +175,9 @@ void LabeledStaticBox::DrawBorderAndLabel(wxDC& dc)
     dc.SetPen(wxPen(border_color.colorForStates(state_handler.states()), m_border_width, wxPENSTYLE_SOLID));
     dc.DrawRoundedRectangle( // Border
         std::max(0, m_pos.x),
-        std::max(0, m_pos.y) + m_label_height * .5,
+        std::max(0, m_pos.y) + m_label_height + 1,
         wSz.GetWidth(),
-        wSz.GetHeight() - m_label_height * .5,
+        std::max(0, wSz.GetHeight() - m_label_height - 1),
         m_radius * m_scale
     );
 
@@ -195,6 +195,7 @@ void LabeledStaticBox::DrawBorderAndLabel(wxDC& dc)
 void LabeledStaticBox::GetBordersForSizer(int* borderTop, int* borderOther) const {
     wxStaticBox::GetBordersForSizer(borderTop, borderOther);
 #ifdef __WXOSX__
+    *borderTop = std::max(*borderTop, m_label_height + FromDIP(4));
     *borderOther = 5; // Make sure macOS uses the same border padding as other platforms
 #endif
 }

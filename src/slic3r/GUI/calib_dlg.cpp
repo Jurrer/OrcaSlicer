@@ -26,6 +26,7 @@
 #include <boost/filesystem/operations.hpp>
 #include "slic3r/GUI/wxExtensions.hpp"
 #include <wx/dcgraph.h>
+#include <wx/dcbuffer.h>
 #include "MainFrame.hpp"
 #include "Widgets/DialogButtons.hpp"
 #include <string>
@@ -81,6 +82,34 @@ CheckBox* add_scale_checkbox(wxWindow* parent, wxSizer* settings_sizer)
     row->Add(text, 0, wxALL | wxALIGN_CENTER_VERTICAL, parent->FromDIP(2));
     settings_sizer->Add(row, 0, wxLEFT | wxTOP, parent->FromDIP(3));
     return cb;
+}
+
+static wxPanel* create_filament_color_swatch(wxWindow* parent, const std::string& color)
+{
+    wxColour filament_color = wxColour(color);
+    if (!filament_color.IsOk())
+        filament_color = wxColour("WHITE");
+    const int swatch_size = parent->FromDIP(20);
+    auto* swatch = new wxPanel(parent, wxID_ANY, wxDefaultPosition, wxSize(swatch_size, swatch_size));
+    swatch->SetBackgroundStyle(wxBG_STYLE_PAINT);
+    swatch->SetMinSize(wxSize(swatch_size, swatch_size));
+    swatch->Bind(wxEVT_PAINT, [swatch, filament_color](wxPaintEvent&) {
+        wxAutoBufferedPaintDC dc(swatch);
+        const wxSize size = swatch->GetClientSize();
+        dc.SetPen(*wxTRANSPARENT_PEN);
+        dc.SetBrush(wxBrush(filament_color));
+        dc.DrawRectangle(0, 0, size.GetWidth(), size.GetHeight());
+
+        const bool dark_mode = wxGetApp().dark_mode();
+        const bool near_white = filament_color.Red() > 224 && filament_color.Green() > 224 && filament_color.Blue() > 224;
+        const bool near_black = filament_color.Red() < 45 && filament_color.Green() < 45 && filament_color.Blue() < 45;
+        if ((!dark_mode && near_white) || (dark_mode && near_black)) {
+            dc.SetPen(wxPen(dark_mode ? wxColour(207, 207, 207) : wxColour(130, 130, 128), 1));
+            dc.SetBrush(*wxTRANSPARENT_BRUSH);
+            dc.DrawRectangle(0, 0, size.GetWidth(), size.GetHeight());
+        }
+    });
+    return swatch;
 }
 
 std::vector<std::string> get_shaper_type_values()
@@ -1889,8 +1918,278 @@ void FlowRateCalibrationDialog::on_dpi_changed(const wxRect& suggested_rect) {
     this->Refresh();
 }
 
+namespace {
+
+struct BatchCalibrationTemperatureRow {
+    int extruder;
+    int start_temperature;
+    int end_temperature;
+    std::string filament_type;
+};
+
+static int batch_filament_type_selection(const std::string& filament_type)
+{
+    if (filament_type == "PLA")
+        return tPLA;
+    if (filament_type == "ABS" || filament_type == "ASA")
+        return tABS_ASA;
+    if (filament_type == "PETG")
+        return tPETG;
+    if (filament_type == "PCTG")
+        return tPCTG;
+    if (filament_type == "TPU")
+        return tTPU;
+    if (filament_type == "PA-CF")
+        return tPA_CF;
+    if (filament_type == "PET-CF")
+        return tPET_CF;
+    return tCustom;
+}
+
+static std::string batch_filament_type_name(int filament_type)
+{
+    switch (filament_type) {
+    case tPLA: return "PLA";
+    case tABS_ASA: return "ABS";
+    case tPETG: return "PETG";
+    case tPCTG: return "PCTG";
+    case tTPU: return "TPU";
+    case tPA_CF: return "PA-CF";
+    case tPET_CF: return "PET-CF";
+    default: return std::string();
+    }
+}
+
+class BatchCalibrationSettingsDialog : public DPIDialog {
+public:
+    BatchCalibrationSettingsDialog(wxWindow* parent, wxWindowID id, Plater* plater,
+                                   const std::vector<int>& selected_extruders, bool temperature_tower,
+                                   const std::vector<CalibrationNozzle>& nozzle_assignments,
+                                   const std::vector<wxString>& selected_filament_names,
+                                   const std::vector<std::string>& selected_filament_colours,
+                                   const std::vector<BatchCalibrationTemperatureRow>& temperature_rows);
+    void on_dpi_changed(const wxRect& suggested_rect) override;
+
+private:
+    struct BatchCalibrationTemperatureInput {
+        int extruder;
+        TextInput* start_input;
+        TextInput* end_input;
+    };
+
+    void on_start(wxCommandEvent& event);
+
+    RadioGroup* m_rbType;
+    ComboBox* m_rbPattern;
+    std::vector<BatchCalibrationTemperatureInput> m_temperature_inputs;
+    std::vector<int> m_selected_extruders;
+    std::vector<wxString> m_selected_filament_names;
+    std::vector<std::string> m_selected_filament_colours;
+    std::vector<CalibrationNozzle> m_nozzle_assignments;
+    bool m_temperature_tower;
+    Plater* m_plater;
+};
+
+BatchCalibrationSettingsDialog::BatchCalibrationSettingsDialog(
+    wxWindow* parent, wxWindowID id, Plater* plater, const std::vector<int>& selected_extruders,
+    bool temperature_tower, const std::vector<CalibrationNozzle>& nozzle_assignments,
+    const std::vector<wxString>& selected_filament_names,
+    const std::vector<std::string>& selected_filament_colours,
+    const std::vector<BatchCalibrationTemperatureRow>& temperature_rows)
+    : DPIDialog(parent, id, temperature_tower ? _L("Batch Temperature Tower Calibration") : _L("Batch Flow Ratio Calibration"),
+                wxDefaultPosition, wxDefaultSize, wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER),
+      m_selected_extruders(selected_extruders),
+    m_selected_filament_names(selected_filament_names),
+      m_selected_filament_colours(selected_filament_colours),
+      m_nozzle_assignments(nozzle_assignments),
+      m_temperature_tower(temperature_tower), m_plater(plater)
+{
+    SetBackgroundColour(*wxWHITE);
+    SetForegroundColour(wxColour("#363636"));
+    SetFont(Label::Body_14);
+
+    auto v_sizer = new wxBoxSizer(wxVERTICAL);
+
+    auto selected_filaments_box = new LabeledStaticBox(this, _L("Selected filaments"));
+    auto selected_filaments_sizer = new wxStaticBoxSizer(selected_filaments_box, wxVERTICAL);
+    selected_filaments_sizer->AddSpacer(FromDIP(10));
+    auto selected_filament_rows = new wxBoxSizer(wxVERTICAL);
+    for (size_t filament_index = 0; filament_index < m_selected_filament_names.size(); ++filament_index) {
+        const std::string filament_colour = filament_index < m_selected_filament_colours.size() ?
+                                              m_selected_filament_colours[filament_index] :
+                                              std::string();
+        auto filament_row = new wxBoxSizer(wxHORIZONTAL);
+        filament_row->Add(create_filament_color_swatch(selected_filaments_box, filament_colour), 0, wxALIGN_CENTER_VERTICAL);
+        auto filament_name = new Label(selected_filaments_box, m_selected_filament_names[filament_index], LB_AUTO_WRAP);
+        filament_name->SetMinSize(wxSize(FromDIP(320), -1));
+        filament_row->Add(filament_name, 1, wxLEFT | wxALIGN_CENTER_VERTICAL | wxEXPAND, FromDIP(6));
+        selected_filament_rows->Add(filament_row, filament_index == 0 ? 0 : wxTOP, FromDIP(3));
+    }
+    selected_filaments_sizer->Add(selected_filament_rows, 0, wxEXPAND | wxTOP | wxLEFT | wxRIGHT | wxBOTTOM, FromDIP(5));
+    v_sizer->Add(selected_filaments_sizer, 0, wxTOP | wxRIGHT | wxLEFT | wxEXPAND, FromDIP(10));
+
+    RadioGroup* filament_type_selector = nullptr;
+    if (m_temperature_tower) {
+        auto filament_type_box = new LabeledStaticBox(this, _L("Filament type"));
+        auto filament_type_sizer = new wxStaticBoxSizer(filament_type_box, wxVERTICAL);
+        filament_type_sizer->AddSpacer(FromDIP(10));
+        filament_type_selector = new RadioGroup(filament_type_box, { _L("PLA"), _L("ABS/ASA"), _L("PETG"), _L("PCTG"), _L("TPU"), _L("PA-CF"), _L("PET-CF"), _L("Custom") }, wxVERTICAL, 2);
+        const bool same_filament_type = !temperature_rows.empty() && std::all_of(temperature_rows.begin(), temperature_rows.end(), [&temperature_rows](const BatchCalibrationTemperatureRow& row) {
+            return row.filament_type == temperature_rows.front().filament_type;
+        });
+        filament_type_selector->SetSelection(batch_filament_type_selection(same_filament_type ? temperature_rows.front().filament_type : std::string()));
+        filament_type_sizer->Add(filament_type_selector, 0, wxLEFT | wxRIGHT | wxBOTTOM | wxEXPAND, FromDIP(4));
+        v_sizer->Add(filament_type_sizer, 0, wxTOP | wxRIGHT | wxLEFT | wxEXPAND, FromDIP(10));
+    }
+
+    if (!m_temperature_tower) {
+        auto type_box = new LabeledStaticBox(this, _L("Flow Ratio variant"));
+        auto type_sizer = new wxStaticBoxSizer(type_box, wxVERTICAL);
+        m_rbType = new RadioGroup(this, { _L("Pass 1"), _L("Pass 2"), _L("YOLO Linear"), _L("YOLO Fine") }, wxVERTICAL, 1);
+        m_rbType->SetSelection(0);
+        type_sizer->Add(m_rbType, 0, wxALL, FromDIP(4));
+        v_sizer->Add(type_sizer, 0, wxTOP | wxRIGHT | wxLEFT | wxEXPAND, FromDIP(10));
+    }
+
+    auto settings_box = new LabeledStaticBox(this, _L("Settings"));
+    auto settings_sizer = new wxStaticBoxSizer(settings_box, wxVERTICAL);
+    if (!m_temperature_tower) {
+        auto pattern_sizer = new wxBoxSizer(wxHORIZONTAL);
+        auto pattern_text = new Label(this, _L("Top Surface Pattern"), wxALIGN_LEFT);
+        m_rbPattern = new ComboBox(this, wxID_ANY, wxEmptyString, wxDefaultPosition, wxDefaultSize, 0, nullptr, wxCB_READONLY);
+        m_rbPattern->Append(_L("Archimedean Chords"));
+        m_rbPattern->Append(_L("Monotonic"));
+        m_rbPattern->SetSelection(0);
+        const int pattern_width = std::max(m_rbPattern->GetTextExtent(_L("Archimedean Chords")).x,
+                                           m_rbPattern->GetTextExtent(_L("Monotonic")).x) + FromDIP(48);
+        m_rbPattern->SetMinSize(wxSize(pattern_width, -1));
+        pattern_sizer->Add(pattern_text, 0, wxALL | wxALIGN_CENTER_VERTICAL, FromDIP(2));
+        pattern_sizer->Add(m_rbPattern, 0, wxALL | wxALIGN_CENTER_VERTICAL, FromDIP(2));
+        settings_sizer->Add(pattern_sizer, 0, wxEXPAND | wxALL, FromDIP(10));
+    } else {
+        auto temperature_grid = new wxFlexGridSizer(3, FromDIP(0), FromDIP(4));
+        auto filament_header = new Label(this, _L("Filament"), wxALIGN_LEFT);
+        auto start_header = new Label(this, _L("Start"), wxALIGN_LEFT);
+        auto end_header = new Label(this, _L("End"), wxALIGN_LEFT);
+        temperature_grid->Add(filament_header, 0, wxALIGN_LEFT);
+        temperature_grid->Add(start_header, 0, wxALIGN_LEFT);
+        temperature_grid->Add(end_header, 0, wxALIGN_LEFT);
+        settings_sizer->Add(temperature_grid, 0, wxEXPAND | wxALL, FromDIP(10));
+
+        for (const BatchCalibrationTemperatureRow& row : temperature_rows) {
+            auto filament_text = new Label(this, wxString::Format(_L("Filament %d"), row.extruder + 1), wxALIGN_LEFT);
+            const wxString start_value = std::to_string(row.start_temperature);
+            const wxString end_value = std::to_string(row.end_temperature);
+            const int input_width = std::max(GetTextExtent(start_value).x, GetTextExtent(end_value).x) +
+                                      GetTextExtent(_L("℃")).x + FromDIP(20);
+            auto start_input = new TextInput(this, start_value, _L("℃"), "", wxDefaultPosition, wxSize(input_width, -1));
+            auto end_input = new TextInput(this, end_value, _L("℃"), "", wxDefaultPosition, wxSize(input_width, -1));
+            start_input->GetTextCtrl()->SetValidator(wxTextValidator(wxFILTER_NUMERIC));
+            end_input->GetTextCtrl()->SetValidator(wxTextValidator(wxFILTER_NUMERIC));
+            temperature_grid->Add(filament_text, 0, wxALIGN_CENTER_VERTICAL);
+            temperature_grid->Add(start_input, 0, wxALIGN_CENTER_VERTICAL);
+            temperature_grid->Add(end_input, 0, wxALIGN_CENTER_VERTICAL);
+            m_temperature_inputs.push_back(BatchCalibrationTemperatureInput{row.extruder, start_input, end_input});
+        }
+
+        auto temp_step_sizer = new wxBoxSizer(wxHORIZONTAL);
+        auto temp_step_text = new wxStaticText(this, wxID_ANY, _L("Temp step: "), wxDefaultPosition, wxDefaultSize, wxALIGN_LEFT);
+        auto temp_step_input = new TextInput(this, wxString::FromDouble(5), _L("\u2103"), "", wxDefaultPosition, wxSize(FromDIP(120), -1));
+        temp_step_input->Enable(false);
+        temp_step_sizer->Add(temp_step_text, 0, wxALL | wxALIGN_CENTER_VERTICAL, FromDIP(2));
+        temp_step_sizer->Add(temp_step_input, 0, wxALL | wxALIGN_CENTER_VERTICAL, FromDIP(2));
+        settings_sizer->Add(temp_step_sizer, 0, wxLEFT, FromDIP(3));
+
+        filament_type_selector->Bind(wxEVT_COMMAND_RADIOBOX_SELECTED, [this](wxCommandEvent& event) {
+            const auto [start_temperature, end_temperature] = batch_temperature_tower_defaults(batch_filament_type_name(event.GetSelection()));
+            for (auto& [extruder, start_input, end_input] : m_temperature_inputs) {
+                start_input->GetTextCtrl()->SetValue(std::to_string(start_temperature));
+                end_input->GetTextCtrl()->SetValue(std::to_string(end_temperature));
+            }
+            event.Skip();
+        });
+    }
+    v_sizer->Add(settings_sizer, 0, wxTOP | wxRIGHT | wxLEFT | wxEXPAND, FromDIP(10));
+
+    auto sequence_note = new Label(this, _L("Generated batches print one filament time using By Object. "
+                                            "Changing the project to By Layer removes that isolation; "
+                                            "physical print order is not tied to selection or layout order."),
+                                   LB_AUTO_WRAP, wxSize(FromDIP(360), -1));
+    sequence_note->SetToolTip(_L("By Object is required for one-filament-at-a-time calibration isolation."));
+    v_sizer->Add(sequence_note, 0, wxTOP | wxRIGHT | wxLEFT | wxEXPAND, FromDIP(10));
+
+    auto dlg_btns = new DialogButtons(this, {"OK"});
+    dlg_btns->GetOK()->Bind(wxEVT_BUTTON, &BatchCalibrationSettingsDialog::on_start, this);
+    v_sizer->AddSpacer(FromDIP(8));
+    v_sizer->Add(dlg_btns, 0, wxEXPAND);
+
+    SetSizerAndFit(v_sizer);
+    SetSize(wxSize(FromDIP(560), -1));
+    wxGetApp().UpdateDlgDarkUI(this);
+}
+
+void BatchCalibrationSettingsDialog::on_start(wxCommandEvent& event) {
+    if (m_temperature_tower) {
+        std::vector<Calib_Params> tower_params;
+        tower_params.reserve(m_temperature_inputs.size());
+        for (const auto& [extruder, start_input, end_input] : m_temperature_inputs) {
+            long start_temperature = 0;
+            long end_temperature = 0;
+            start_input->GetTextCtrl()->GetValue().ToLong(&start_temperature);
+            end_input->GetTextCtrl()->GetValue().ToLong(&end_temperature);
+
+            Calib_Params params;
+            params.mode = CalibMode::Calib_Temp_Tower;
+            params.extruder_id = extruder;
+            params.start = start_temperature;
+            params.end = end_temperature;
+            params.nozzle_based_resize = true;
+            tower_params.push_back(params);
+        }
+
+        wxString error_message;
+        if (!m_plater->calib_batch_temperature(tower_params, error_message)) {
+            if (!error_message.empty()) {
+                MessageDialog msg_dlg(this, error_message, wxEmptyString, wxICON_WARNING | wxOK);
+                msg_dlg.ShowModal();
+            }
+            return;
+        }
+    } else {
+        int type = m_rbType->GetSelection();
+        InfillPattern pattern = ipArchimedeanChords;
+        if (m_rbPattern->GetSelection() == 1)
+            pattern = ipMonotonic;
+        bool is_linear = (type >= 2);
+        int pass = (type % 2) + 1;
+
+        wxString error_message;
+        if (!m_plater->calib_batch_flowrate(
+                m_selected_extruders, m_nozzle_assignments, is_linear, pass, pattern, error_message)) {
+            if (!error_message.empty()) {
+                MessageDialog msg_dlg(this, error_message, wxEmptyString, wxICON_WARNING | wxOK);
+                msg_dlg.ShowModal();
+            }
+            return;
+        }
+    }
+
+    EndModal(wxID_OK);
+    event.Skip();
+}
+
+void BatchCalibrationSettingsDialog::on_dpi_changed(const wxRect& suggested_rect) {
+    if (GetSizer() != nullptr) {
+        GetSizer()->SetSizeHints(this);
+        Fit();
+    }
+    this->Refresh();
+}
+
+}
+
 BatchCalibrationDialog::BatchCalibrationDialog(wxWindow* parent, wxWindowID id, Plater* plater)
-    : DPIDialog(parent, id, _L("Batch Calibration"), wxDefaultPosition, wxDefaultSize, wxDEFAULT_DIALOG_STYLE),
+    : DPIDialog(parent, id, _L("Batch Calibration"), wxDefaultPosition, wxDefaultSize, wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER),
       m_plater(plater)
 {
     SetBackgroundColour(*wxWHITE);
@@ -1901,12 +2200,20 @@ BatchCalibrationDialog::BatchCalibrationDialog(wxWindow* parent, wxWindowID id, 
 
     auto filament_box = new LabeledStaticBox(this, _L("Loaded filaments"));
     auto filament_sizer = new wxStaticBoxSizer(filament_box, wxVERTICAL);
-    filament_sizer->AddSpacer(FromDIP(5));
+    filament_sizer->AddSpacer(FromDIP(10));
     const auto* preset_bundle = wxGetApp().preset_bundle;
+    const auto& project_config = preset_bundle->project_config;
     const auto full_config = preset_bundle->full_config();
     const auto* flow_ratios = full_config.option<ConfigOptionFloatsNullable>("filament_flow_ratio");
+    const auto* nozzle_diameters = full_config.option<ConfigOptionFloats>("nozzle_diameter");
+    const auto* extruder_printable_areas = full_config.option<ConfigOptionPointsGroups>("extruder_printable_area");
+    const bool dual_nozzle = nozzle_diameters != nullptr && nozzle_diameters->size() == 2 &&
+        extruder_printable_areas != nullptr && extruder_printable_areas->size() >= 2;
     const size_t filament_count = flow_ratios == nullptr ? 0 :
         std::min(preset_bundle->filament_presets.size(), flow_ratios->values.size());
+
+    auto filament_grid = new wxFlexGridSizer(dual_nozzle ? 3 : 2, FromDIP(0), FromDIP(3));
+    filament_grid->AddGrowableCol(1, 1);
     for (size_t extruder = 0; extruder < filament_count; ++extruder) {
         const double flow_ratio = flow_ratios->get_at(static_cast<int>(extruder));
         wxString label = wxString::Format(_L("Filament %d"), static_cast<int>(extruder + 1));
@@ -1924,89 +2231,121 @@ BatchCalibrationDialog::BatchCalibrationDialog(wxWindow* parent, wxWindowID id, 
         if (flow_usable)
             label += wxString::Format(_L(" (Flow ratio: %.3f)"), flow_ratio);
         const auto [start_temperature, end_temperature] = batch_temperature_tower_defaults(filament_type);
+        std::string filament_colour;
+        if (const auto* filament_colour_option = project_config.option<ConfigOptionStrings>("filament_colour");
+            filament_colour_option != nullptr && extruder < filament_colour_option->values.size())
+            filament_colour = filament_colour_option->get_at(static_cast<unsigned int>(extruder));
+        if (filament_colour.empty() && preset != nullptr) {
+            if (const auto* default_filament_colour_option = preset->config.option<ConfigOptionStrings>("default_filament_colour");
+                default_filament_colour_option != nullptr && !default_filament_colour_option->values.empty())
+                filament_colour = default_filament_colour_option->get_at(0);
+        }
 
-        auto checkbox = new ::CheckBox(this);
-        auto filament_row = new wxBoxSizer(wxHORIZONTAL);
-        filament_row->Add(checkbox, 0, wxLEFT | wxBOTTOM | wxALIGN_CENTER_VERTICAL, FromDIP(3));
-        auto label_text = new Label(this, label);
-        filament_row->Add(label_text, 0, wxLEFT | wxBOTTOM | wxALIGN_CENTER_VERTICAL, FromDIP(8));
-        auto start_input = new TextInput(this, std::to_string(start_temperature), _L("\u2103" /* °C */), "", wxDefaultPosition, FromDIP(wxSize(75, -1)));
-        auto end_input = new TextInput(this, std::to_string(end_temperature), _L("\u2103" /* °C */), "", wxDefaultPosition, FromDIP(wxSize(75, -1)));
-        filament_row->Add(start_input, 0, wxLEFT | wxBOTTOM | wxALIGN_CENTER_VERTICAL, FromDIP(6));
-        filament_row->Add(end_input, 0, wxLEFT | wxBOTTOM | wxALIGN_CENTER_VERTICAL, FromDIP(6));
-        filament_sizer->Add(filament_row, 0, wxLEFT | wxBOTTOM, FromDIP(3));
+        auto checkbox = new ::CheckBox(filament_box);
+        ComboBox* nozzle_choice = nullptr;
+        if (dual_nozzle) {
+            nozzle_choice = new ComboBox(
+                filament_box, wxID_ANY, wxEmptyString, wxDefaultPosition, wxDefaultSize, 0, nullptr,
+                wxCB_READONLY);
+            nozzle_choice->Append(_L("Left nozzle"));
+            nozzle_choice->Append(_L("Right nozzle"));
+            nozzle_choice->SetSelection(0);
+            nozzle_choice->SetToolTip(_L("Used only for calibration placement; it does not assign the filament to a nozzle."));
+            const int nozzle_width = std::max(
+                nozzle_choice->GetTextExtent(_L("Left nozzle")).x, nozzle_choice->GetTextExtent(_L("Right nozzle")).x) + FromDIP(48);
+            nozzle_choice->SetMinSize(wxSize(nozzle_width, -1));
+        }
+        auto label_text = new Label(filament_box, label, LB_AUTO_WRAP);
+        label_text->SetMinSize(wxSize(FromDIP(320), -1));
+        label_text->SetCursor(wxCURSOR_HAND);
+        label_text->Bind(wxEVT_LEFT_DOWN, [checkbox](wxMouseEvent& event) {
+            if (checkbox->IsEnabled())
+                checkbox->SetValue(!checkbox->GetValue());
+            event.Skip();
+        });
+        auto label_sizer = new wxBoxSizer(wxHORIZONTAL);
+        auto filament_colour_swatch = create_filament_color_swatch(filament_box, filament_colour);
+        filament_colour_swatch->SetCursor(wxCURSOR_HAND);
+        filament_colour_swatch->Bind(wxEVT_LEFT_DOWN, [checkbox](wxMouseEvent& event) {
+            if (checkbox->IsEnabled())
+                checkbox->SetValue(!checkbox->GetValue());
+            event.Skip();
+        });
+        label_sizer->Add(filament_colour_swatch, 0, wxALIGN_CENTER_VERTICAL);
+        filament_grid->Add(checkbox, 0, wxLEFT | wxALIGN_CENTER_VERTICAL, FromDIP(3));
+        label_sizer->Add(label_text, 1, wxLEFT | wxALIGN_CENTER_VERTICAL | wxEXPAND, FromDIP(6));
+        filament_grid->Add(label_sizer, 0, wxLEFT | wxEXPAND, FromDIP(8));
+        if (dual_nozzle)
+            filament_grid->Add(nozzle_choice, 0, wxLEFT | wxALIGN_CENTER_VERTICAL, FromDIP(8));
         m_filament_rows.push_back({
             checkbox,
-            start_input,
-            end_input,
+            nozzle_choice,
             static_cast<int>(extruder),
+            preset ? wxString::FromUTF8(preset->name) : wxString::Format(_L("Filament %d"), static_cast<int>(extruder + 1)),
+            filament_colour,
+        filament_type,
+            start_temperature,
+            end_temperature,
             flow_usable,
             temperature_usable,
         });
     }
+    filament_sizer->Add(filament_grid, 0, wxEXPAND | wxTOP | wxLEFT | wxRIGHT | wxBOTTOM, FromDIP(5));
     v_sizer->Add(filament_sizer, 0, wxTOP | wxRIGHT | wxLEFT | wxEXPAND, FromDIP(10));
 
     auto test_type_box = new LabeledStaticBox(this, _L("Test type"));
     auto test_type_sizer = new wxStaticBoxSizer(test_type_box, wxVERTICAL);
-    m_rbTestType = new RadioGroup(this, { _L("Flow Ratio"), _L("Temperature Tower") }, wxVERTICAL, 1);
+    test_type_sizer->AddSpacer(FromDIP(10));
+    m_rbTestType = new RadioGroup(test_type_box, { _L("Flow Ratio"), _L("Temperature Tower") }, wxVERTICAL, 1);
     m_rbTestType->SetSelection(0);
     test_type_sizer->Add(m_rbTestType, 0, wxALL, FromDIP(4));
     v_sizer->Add(test_type_sizer, 0, wxTOP | wxRIGHT | wxLEFT | wxEXPAND, FromDIP(10));
 
-    auto type_box = new LabeledStaticBox(this, _L("Flow Ratio variant"));
-    auto type_sizer = new wxStaticBoxSizer(type_box, wxVERTICAL);
-    m_rbType = new RadioGroup(this, { _L("Pass 1"), _L("Pass 2"), _L("YOLO Linear"), _L("YOLO Fine") }, wxVERTICAL, 1);
-    m_rbType->SetSelection(0);
-    type_sizer->Add(m_rbType, 0, wxALL, FromDIP(4));
-    v_sizer->Add(type_sizer, 0, wxTOP | wxRIGHT | wxLEFT | wxEXPAND, FromDIP(10));
-
-    auto settings_box = new LabeledStaticBox(this, _L("Settings"));
-    auto settings_sizer = new wxStaticBoxSizer(settings_box, wxVERTICAL);
-    settings_sizer->AddSpacer(FromDIP(5));
-    auto pattern_sizer = new wxBoxSizer(wxHORIZONTAL);
-        auto pattern_text = new Label(this, _L("Top Surface Pattern"), wxALIGN_LEFT, FromDIP(wxSize(120, -1)));
-    m_rbPattern = new ComboBox(this, wxID_ANY, wxEmptyString, wxDefaultPosition, FromDIP(wxSize(120, -1)), 0, nullptr, wxCB_READONLY);
-    m_rbPattern->Append(_L("Archimedean Chords"));
-    m_rbPattern->Append(_L("Monotonic"));
-    m_rbPattern->SetSelection(0);
-    pattern_sizer->Add(pattern_text, 0, wxALL | wxALIGN_CENTER_VERTICAL, FromDIP(2));
-    pattern_sizer->Add(m_rbPattern, 0, wxALL | wxALIGN_CENTER_VERTICAL, FromDIP(2));
-    settings_sizer->Add(pattern_sizer, 0, wxALL, FromDIP(2));
-    m_cbResize = add_scale_checkbox(this, settings_sizer);
-    v_sizer->Add(settings_sizer, 0, wxTOP | wxRIGHT | wxLEFT | wxEXPAND, FromDIP(10));
-
-    auto sequence_note = new Label(this,
-        _L("Generated batches print one filament at a time using By Object. "
-           "Changing the project to By Layer removes that isolation; physical print order is not tied to selection or layout order."));
-    sequence_note->SetToolTip(_L("By Object is required for one-filament-at-a-time calibration isolation."));
-    v_sizer->Add(sequence_note, 0, wxTOP | wxRIGHT | wxLEFT | wxEXPAND, FromDIP(10));
-
-    auto dlg_btns = new DialogButtons(this, {"OK"});
-    dlg_btns->GetOK()->Bind(wxEVT_BUTTON, &BatchCalibrationDialog::on_start, this);
+    auto dlg_btns = new DialogButtons(this, {"Next"});
+    dlg_btns->GetNEXT()->Bind(wxEVT_BUTTON, &BatchCalibrationDialog::on_next, this);
     v_sizer->AddSpacer(FromDIP(8));
     v_sizer->Add(dlg_btns, 0, wxEXPAND);
 
     SetSizerAndFit(v_sizer);
+    SetSize(wxSize(FromDIP(560), -1));
     m_rbTestType->Bind(wxEVT_COMMAND_RADIOBOX_SELECTED, [this](wxCommandEvent& event) {
         on_test_type_changed(event);
     });
-    m_cbResize->Disable();
-    for (const BatchFilamentRow& row : m_filament_rows) {
-        row.start_temperature->Disable();
-        row.end_temperature->Disable();
-    }
     update_filament_availability();
     wxGetApp().UpdateDlgDarkUI(this);
 }
 
-void BatchCalibrationDialog::on_start(wxCommandEvent& event)
+void BatchCalibrationDialog::on_next(wxCommandEvent& event)
 {
-    std::vector<int> selected_extruders;
+    std::vector<std::pair<int, CalibrationNozzle>> selected_filaments;
     for (const BatchFilamentRow& row : m_filament_rows) {
         if (row.check->GetValue())
-            selected_extruders.push_back(row.extruder);
+            selected_filaments.emplace_back(
+                row.extruder,
+                row.nozzle_choice == nullptr || row.nozzle_choice->GetSelection() == 0 ?
+                    CalibrationNozzle::Left : CalibrationNozzle::Right);
     }
-    std::sort(selected_extruders.begin(), selected_extruders.end());
+    std::sort(selected_filaments.begin(), selected_filaments.end());
+
+    std::vector<int> selected_extruders;
+    std::vector<CalibrationNozzle> nozzle_assignments;
+    std::vector<wxString> selected_filament_names;
+    std::vector<std::string> selected_filament_colours;
+    selected_extruders.reserve(selected_filaments.size());
+    nozzle_assignments.reserve(selected_filaments.size());
+    selected_filament_names.reserve(selected_filaments.size());
+    selected_filament_colours.reserve(selected_filaments.size());
+    for (const auto& [extruder, nozzle] : selected_filaments) {
+        selected_extruders.push_back(extruder);
+        nozzle_assignments.push_back(nozzle);
+        for (const BatchFilamentRow& row : m_filament_rows) {
+            if (row.extruder == extruder) {
+                selected_filament_names.push_back(row.filament_name);
+                selected_filament_colours.push_back(row.filament_colour);
+                break;
+            }
+        }
+    }
 
     if (selected_extruders.empty()) {
         MessageDialog msg_dlg(this, _L("Please select at least one filament."), wxEmptyString, wxICON_WARNING | wxOK);
@@ -2014,71 +2353,29 @@ void BatchCalibrationDialog::on_start(wxCommandEvent& event)
         return;
     }
 
+    std::vector<BatchCalibrationTemperatureRow> temperature_rows;
+    temperature_rows.reserve(selected_extruders.size());
     if (m_rbTestType->GetSelection() == 1) {
-        std::vector<Calib_Params> tower_params;
-        tower_params.reserve(selected_extruders.size());
         for (const int selected_extruder : selected_extruders) {
-            long start_temperature = 0;
-            long end_temperature = 0;
             for (const BatchFilamentRow& row : m_filament_rows) {
-                if (row.extruder != selected_extruder)
-                    continue;
-                row.start_temperature->GetTextCtrl()->GetValue().ToLong(&start_temperature);
-                row.end_temperature->GetTextCtrl()->GetValue().ToLong(&end_temperature);
+                if (row.extruder == selected_extruder) {
+                    temperature_rows.push_back({ row.extruder, row.start_temperature, row.end_temperature, row.filament_type });
+                    break;
+                }
             }
-
-            Calib_Params params;
-            params.mode = CalibMode::Calib_Temp_Tower;
-            params.extruder_id = selected_extruder;
-            params.start = start_temperature;
-            params.end = end_temperature;
-            params.nozzle_based_resize = m_cbResize->GetValue();
-            tower_params.push_back(params);
         }
+    }
 
-        wxString error_message;
-        if (!m_plater->calib_batch_temperature(tower_params, error_message)) {
-            if (!error_message.empty()) {
-                MessageDialog msg_dlg(this, error_message, wxEmptyString, wxICON_WARNING | wxOK);
-                msg_dlg.ShowModal();
-            }
-            return;
-        }
-
+    BatchCalibrationSettingsDialog settings_dlg(this, wxID_ANY, m_plater, selected_extruders,
+                                                m_rbTestType->GetSelection() == 1, nozzle_assignments, selected_filament_names,
+                                                selected_filament_colours, temperature_rows);
+    if (settings_dlg.ShowModal() == wxID_OK)
         EndModal(wxID_OK);
-        event.Skip();
-        return;
-    }
-
-    const int type = m_rbType->GetSelection();
-    const int pattern_idx = m_rbPattern->GetSelection();
-    InfillPattern pattern = pattern_idx == 1 ? ipMonotonic : ipArchimedeanChords;
-    const bool is_linear = type >= 2;
-    const int pass = (type % 2) + 1;
-
-    wxString error_message;
-    if (!m_plater->calib_batch_flowrate(selected_extruders, is_linear, pass, pattern, error_message)) {
-        if (!error_message.empty()) {
-            MessageDialog msg_dlg(this, error_message, wxEmptyString, wxICON_WARNING | wxOK);
-            msg_dlg.ShowModal();
-        }
-        return;
-    }
-
-    EndModal(wxID_OK);
     event.Skip();
 }
 
 void BatchCalibrationDialog::on_test_type_changed(wxCommandEvent& event)
 {
-    const bool temperature_tower = m_rbTestType->GetSelection() == 1;
-    m_rbType->Enable(!temperature_tower);
-    m_rbPattern->Enable(!temperature_tower);
-    m_cbResize->Enable(temperature_tower);
-    for (const BatchFilamentRow& row : m_filament_rows) {
-        row.start_temperature->Enable(temperature_tower);
-        row.end_temperature->Enable(temperature_tower);
-    }
     update_filament_availability();
     event.Skip();
 }
@@ -2089,6 +2386,8 @@ void BatchCalibrationDialog::update_filament_availability()
     for (BatchFilamentRow& row : m_filament_rows) {
         const bool usable = temperature_tower ? row.temperature_usable : row.flow_usable;
         row.check->Enable(usable);
+        if (row.nozzle_choice != nullptr)
+            row.nozzle_choice->Enable(usable);
         if (!usable)
             row.check->SetValue(false);
         if (!usable)

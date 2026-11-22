@@ -1,5 +1,6 @@
 #pragma once
 #include "Point.hpp"
+#include "Polygon.hpp"
 #include <math.h>
 #include <cmath>
 #include <cstddef>
@@ -20,6 +21,7 @@ namespace Slic3r {
 class GCode;
 class Model;
 class ModelObject;
+class ModelVolume;
 
 enum class CalibMode : int {
     Calib_None = 0,
@@ -60,6 +62,12 @@ struct Calib_Params
     CalibMode mode;
 };
 
+struct CalibrationAssemblyPlacement
+{
+    Vec2d center{0.0, 0.0};
+    double rotation = 0.0;
+};
+
 // Number of printed layers per speed block in the VFA tower. The base model has 5 mm blocks designed
 // for a 0.2 mm layer height (0.4 mm nozzle), i.e. 25 layers per block.
 static constexpr int vfa_layers_per_block = 25;
@@ -71,9 +79,25 @@ enum FlowRatioCalibrationType {
     FINE_CALIBRATION,
 };
 
+enum class CalibrationNozzle {
+    Left,
+    Right,
+};
+
+std::optional<double> flow_ratio_calibration_print_flow_ratio(const std::string &name, double filament_flow_ratio, bool linear);
 std::optional<double> flow_ratio_calibration_print_flow_ratio(const ModelObject &object, double filament_flow_ratio, bool linear);
+std::optional<double> flow_ratio_calibration_print_flow_ratio(const ModelVolume &volume, double filament_flow_ratio, bool linear);
+ModelObject* build_flow_ratio_calibration_assembly(
+    Model &model, std::vector<ModelObject*> &members, int extruder, size_t expected_member_count, std::string &error);
+std::optional<std::vector<CalibrationAssemblyPlacement>> arrange_flow_ratio_calibration_assemblies(
+    const std::vector<Polygon> &assembly_hulls, const Points &bed_points);
+std::optional<std::vector<CalibrationAssemblyPlacement>> arrange_flow_ratio_calibration_assemblies(
+    const std::vector<Polygon> &assembly_hulls, const std::vector<CalibrationNozzle> &nozzle_assignments,
+    const Polygon &left_printable_area, const Polygon &right_printable_area);
 std::pair<int, int> batch_temperature_tower_defaults(const std::string &filament_type);
 bool valid_batch_temperature_tower(int start_temperature, int end_temperature);
+std::optional<int> batch_filament_physical_nozzle_index(
+    int filament_id, const std::vector<int> &filament_map, size_t nozzle_count, bool is_bbl_machine);
 bool batch_nozzle_diameters_match(const std::vector<double> &nozzle_diameters);
 
 class X1CCalibInfos

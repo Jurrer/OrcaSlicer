@@ -215,15 +215,19 @@ public:
     void on_dpi_changed(const wxRect& suggested_rect) override;
 
 protected:
-    virtual void on_start(wxCommandEvent& event);
+    virtual void on_next(wxCommandEvent& event);
     virtual void on_test_type_changed(wxCommandEvent& event);
 
 private:
     struct BatchFilamentRow {
         ::CheckBox* check;
-        TextInput* start_temperature;
-        TextInput* end_temperature;
+        ComboBox* nozzle_choice;
         int extruder;
+        wxString filament_name;
+        std::string filament_colour;
+        std::string filament_type;
+        int start_temperature;
+        int end_temperature;
         bool flow_usable;
         bool temperature_usable;
     };
@@ -231,9 +235,6 @@ private:
     void update_filament_availability();
 
     RadioGroup* m_rbTestType;
-    RadioGroup* m_rbType;
-    ComboBox* m_rbPattern;
-    CheckBox* m_cbResize;
     std::vector<BatchFilamentRow> m_filament_rows;
     Plater* m_plater;
 };

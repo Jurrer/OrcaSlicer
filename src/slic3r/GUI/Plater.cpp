@@ -39,6 +39,7 @@
 #include "libslic3r/GCode/GCodeProcessor.hpp"
 #include "libslic3r/Technologies.hpp"
 #include "libslic3r/BoundingBox.hpp"
+#include "libslic3r/Geometry/ConvexHull.hpp"
 #include "libslic3r/PrintBase.hpp"
 #include "libslic3r/Preset.hpp"
 #include <fstream>
@@ -17029,23 +17030,6 @@ void adjust_settings_for_flowrate_calib(ModelObjectPtrs& objects, bool linear, i
         _obj->config.set_key_value("calib_flowrate_topinfill_special_order", new ConfigOptionBool(true));
         _obj->config.set_key_value("top_surface_fill_order", new ConfigOptionEnum<SurfaceFillOrder>(SurfaceFillOrder::Default));
 
-        // extract flowrate from name, filename format: flowrate_xxx
-        std::string obj_name = _obj->name;
-        assert(obj_name.length() > 9);
-        obj_name = obj_name.substr(9);
-        if (obj_name[0] == 'm')
-            obj_name[0] = '-';
-        // Orca: force set locale to C to avoid parsing error
-        const std::string _loc = std::setlocale(LC_NUMERIC, nullptr);
-        std::setlocale(LC_NUMERIC,"C");
-        auto              modifier  = 1.0f;
-        try {
-            modifier = stof(obj_name);
-        } catch (...) {
-        }
-        // restore locale
-        std::setlocale(LC_NUMERIC, _loc.c_str());
-
         const auto print_flow_ratio = flow_ratio_calibration_print_flow_ratio(*_obj, current_flowrate, linear);
         if (print_flow_ratio)
             _obj->config.set_key_value("print_flow_ratio", new ConfigOptionFloat(*print_flow_ratio));
@@ -17110,7 +17094,41 @@ void Plater::calib_flowrate(bool is_linear, int pass, InfillPattern pattern) {
     changed_objects(object_idx);
 }
 
-static bool arrange_batch_calibration_objects(Model& model)
+struct CalibrationObjectGroup
+{
+    size_t first_object;
+    size_t object_count;
+    CalibrationNozzle nozzle{CalibrationNozzle::Left};
+};
+
+struct CalibrationNozzleAreas
+{
+    Polygon left;
+    Polygon right;
+};
+
+static CalibrationNozzleAreas get_calibration_nozzle_areas(const DynamicPrintConfig& config)
+{
+    const Polygon full_bed{get_bed_shape(config, false)};
+    const auto* nozzle_diameters = config.option<ConfigOptionFloats>("nozzle_diameter");
+    const auto* extruder_printable_areas = config.option<ConfigOptionPointsGroups>("extruder_printable_area");
+    if (nozzle_diameters == nullptr || nozzle_diameters->size() != 2 ||
+        extruder_printable_areas == nullptr || extruder_printable_areas->size() < 2)
+        return {full_bed, full_bed};
+
+    const Pointfs& left_points = extruder_printable_areas->values.front();
+    const Pointfs& right_points = extruder_printable_areas->values[1];
+    if (left_points.size() < 3 || right_points.size() < 3)
+        return {full_bed, full_bed};
+
+    const Polygon left_area = Polygon::new_scale(left_points);
+    const Polygon right_area = Polygon::new_scale(right_points);
+
+    return {left_area, right_area};
+}
+
+static bool arrange_batch_calibration_objects(
+    Model& model, const std::vector<CalibrationObjectGroup>& object_groups = {})
 {
     if (model.objects.empty())
         return true;
@@ -17135,23 +17153,86 @@ static bool arrange_batch_calibration_objects(Model& model)
     if (selected.empty())
         return true;
 
+    arrangement::ArrangePolygons arranged;
+    std::vector<Point> group_centers;
+    if (object_groups.empty()) {
+        arranged = selected;
+    } else {
+        arranged.reserve(object_groups.size());
+        group_centers.reserve(object_groups.size());
+        for (const CalibrationObjectGroup& object_group : object_groups) {
+            if (object_group.object_count == 0 ||
+                object_group.first_object + object_group.object_count > model.objects.size())
+                return false;
+
+            Points hull_points;
+            BoundingBox group_bounding_box;
+            for (size_t object_idx = object_group.first_object;
+                 object_idx < object_group.first_object + object_group.object_count;
+                 ++object_idx) {
+                const ExPolygon& transformed_polygon = selected[object_idx].transformed_poly();
+                hull_points.insert(
+                    hull_points.end(), transformed_polygon.contour.begin(), transformed_polygon.contour.end());
+                group_bounding_box.merge(transformed_polygon.contour.points);
+            }
+
+            const Point group_center = group_bounding_box.center();
+            Points expanded_hull_points;
+            expanded_hull_points.reserve(hull_points.size());
+            for (const Point& point : hull_points) {
+                expanded_hull_points.emplace_back(
+                    point.x() + 2 * (point.x() - group_center.x()),
+                    point.y() + 2 * (point.y() - group_center.y()));
+            }
+
+            arrangement::ArrangePolygon group_polygon = selected[object_group.first_object];
+            group_polygon.poly.contour.points = Geometry::convex_hull(expanded_hull_points).points;
+            group_polygon.translation = Point(0, 0);
+            group_polygon.rotation = 0.0;
+            group_polygon.inflation = 0;
+            group_polygon.bed_idx = 0;
+            group_polygon.itemid = static_cast<int>(arranged.size());
+            arranged.emplace_back(std::move(group_polygon));
+            group_centers.emplace_back(group_center);
+        }
+    }
+
     arrangement::ArrangeParams params = init_arrange_params(wxGetApp().plater());
     params.is_seq_print = true;
     params.bed_shrink_x = BED_SHRINK_SEQ_PRINT;
     params.bed_shrink_y = BED_SHRINK_SEQ_PRINT;
-    update_arrange_params(params, &full_config, selected);
-    update_selected_items_inflation(selected, &full_config, params);
+    params.allow_rotations = object_groups.empty() ? params.allow_rotations : false;
+    update_arrange_params(params, &full_config, arranged);
+    update_selected_items_inflation(arranged, &full_config, params);
     const Points bed_points = get_shrink_bedpts(&full_config, params);
-    arrangement::arrange(selected, bed_points, params);
+    arrangement::arrange(arranged, bed_points, params);
 
-    for (const arrangement::ArrangePolygon& arrange_polygon : selected) {
+    for (const arrangement::ArrangePolygon& arrange_polygon : arranged) {
         if (arrange_polygon.bed_idx != 0)
             return false;
     }
 
-    for (size_t item_idx = 0; item_idx < selected.size(); ++item_idx) {
-        instances[item_idx]->apply_arrange_result(selected[item_idx].translation.cast<double>(), selected[item_idx].rotation);
-        instances[item_idx]->arrange_order = selected[item_idx].itemid;
+    if (object_groups.empty()) {
+        for (size_t item_idx = 0; item_idx < arranged.size(); ++item_idx) {
+            instances[item_idx]->apply_arrange_result(
+                arranged[item_idx].translation.cast<double>(), arranged[item_idx].rotation);
+            instances[item_idx]->arrange_order = arranged[item_idx].itemid;
+        }
+    } else {
+        for (size_t group_idx = 0; group_idx < object_groups.size(); ++group_idx) {
+            const arrangement::ArrangePolygon& group_polygon = arranged[group_idx];
+            const Point& group_center = group_centers[group_idx];
+            for (size_t item_idx = object_groups[group_idx].first_object;
+                 item_idx < object_groups[group_idx].first_object + object_groups[group_idx].object_count;
+                 ++item_idx) {
+                const Vec2d translation =
+                    selected[item_idx].translation.cast<double>() + group_polygon.translation.cast<double>() +
+                    (selected[item_idx].translation - group_center).cast<double>();
+                instances[item_idx]->apply_arrange_result(translation, selected[item_idx].rotation);
+                instances[item_idx]->arrange_order = group_polygon.itemid * static_cast<int>(selected.size()) +
+                                                      static_cast<int>(item_idx);
+            }
+        }
     }
 
     return true;
@@ -17162,6 +17243,57 @@ static const Preset* batch_selected_filament_preset(const PresetBundle& preset_b
     if (extruder < 0 || extruder >= static_cast<int>(preset_bundle.filament_presets.size()))
         return nullptr;
     return preset_bundle.filaments.find_preset(preset_bundle.filament_presets[extruder], false);
+}
+
+static bool arrange_calibration_assembly_objects(
+    Model& model, const std::vector<CalibrationObjectGroup>& object_groups)
+{
+    if (object_groups.empty())
+        return arrange_batch_calibration_objects(model, {});
+
+    std::vector<Polygon> assembly_hulls;
+    std::vector<ModelInstance*> instances;
+    assembly_hulls.reserve(object_groups.size());
+    instances.reserve(object_groups.size());
+    for (const CalibrationObjectGroup& object_group : object_groups) {
+        if (object_group.object_count != 1 ||
+            object_group.first_object >= model.objects.size())
+            return false;
+        ModelObject* object = model.objects[object_group.first_object];
+        if (object->instances.empty())
+            return false;
+
+        const auto full_config = wxGetApp().preset_bundle->full_config();
+        arrangement::ArrangePolygon arrange_polygon = get_instance_arrange_poly(object->instances.front(), full_config);
+        assembly_hulls.push_back(arrange_polygon.poly.contour);
+        instances.push_back(object->instances.front());
+    }
+
+    const auto full_config = wxGetApp().preset_bundle->full_config();
+    const CalibrationNozzleAreas nozzle_areas = get_calibration_nozzle_areas(full_config);
+    std::vector<CalibrationNozzle> nozzle_assignments;
+    nozzle_assignments.reserve(object_groups.size());
+    for (const CalibrationObjectGroup& object_group : object_groups)
+        nozzle_assignments.push_back(object_group.nozzle);
+    const auto placements = arrange_flow_ratio_calibration_assemblies(
+        assembly_hulls, nozzle_assignments, nozzle_areas.left, nozzle_areas.right);
+    if (!placements.has_value())
+        return false;
+
+    for (size_t assembly_idx = 0; assembly_idx < object_groups.size(); ++assembly_idx) {
+        ModelInstance* instance = instances[assembly_idx];
+        const Vec3d current_offset = instance->get_offset();
+        const Vec3d current_center = instance->get_object()->instance_bounding_box(0, false).center();
+        const Vec2d placement_offset(
+            current_offset.x() + placements->at(assembly_idx).center.x() - current_center.x(),
+            current_offset.y() + placements->at(assembly_idx).center.y() - current_center.y());
+        instance->apply_arrange_result(
+            Vec2d(scale_(placement_offset.x()), scale_(placement_offset.y())),
+            placements->at(assembly_idx).rotation);
+        instance->arrange_order = static_cast<int>(assembly_idx);
+    }
+
+    return true;
 }
 
 static bool begin_batch_calibration_project(const wxString& project_name)
@@ -17178,22 +17310,37 @@ static bool begin_batch_calibration_project(const wxString& project_name)
     return true;
 }
 
-static bool finish_batch_calibration(Plater& plater, Model& model, const wxString& output_name, wxString& error_message)
+static bool finish_batch_calibration(
+    Plater& plater, Model& model,
+    const std::vector<CalibrationObjectGroup>& object_groups, wxString& error_message)
 {
-    if (!arrange_batch_calibration_objects(model)) {
+    if (!arrange_calibration_assembly_objects(model, object_groups)) {
         error_message = _L("The batch does not fit on one plate with the current sequential print clearance. "
                            "Reduce the batch, reduce object sizes, or increase the printable area.");
         return false;
     }
 
+    if (!object_groups.empty()) {
+        Print validation_print;
+        const auto validation_config = wxGetApp().preset_bundle->full_config();
+        validation_print.apply(model, validation_config);
+        const StringObjectException clearance_exception = Print::sequential_print_clearance_valid(validation_print);
+        if (!clearance_exception.string.empty()) {
+            error_message = _L("The batch does not fit on one plate with the current sequential print clearance. "
+                               "Reduce the batch, reduce object sizes, or increase the printable area.");
+            return false;
+        }
+    }
+
     const std::vector<size_t> object_indices(
         boost::counting_iterator<size_t>(0), boost::counting_iterator<size_t>(model.objects.size()));
     plater.changed_objects(object_indices);
-    plater.export_gcode(false, output_name);
     return true;
 }
 
-bool Plater::calib_batch_flowrate(const std::vector<int>& extruders, bool is_linear, int pass, InfillPattern pattern, wxString& error_message)
+bool Plater::calib_batch_flowrate(
+    const std::vector<int>& extruders, const std::vector<CalibrationNozzle>& nozzle_assignments,
+    bool is_linear, int pass, InfillPattern pattern, wxString& error_message)
 {
     error_message.Clear();
     if (extruders.empty()) {
@@ -17202,6 +17349,10 @@ bool Plater::calib_batch_flowrate(const std::vector<int>& extruders, bool is_lin
     }
     if (pass != 1 && pass != 2) {
         error_message = _L("Please select a Flow Ratio calibration variant.");
+        return false;
+    }
+    if (nozzle_assignments.size() != extruders.size()) {
+        error_message = _L("Please select a calibration nozzle for each selected filament.");
         return false;
     }
 
@@ -17222,17 +17373,25 @@ bool Plater::calib_batch_flowrate(const std::vector<int>& extruders, bool is_lin
         }
     }
 
+    std::vector<int> ordered_extruders(extruders);
+    std::sort(ordered_extruders.begin(), ordered_extruders.end());
+    std::map<int, CalibrationNozzle> nozzle_by_extruder;
+    for (size_t extruder_idx = 0; extruder_idx < extruders.size(); ++extruder_idx)
+        nozzle_by_extruder.emplace(extruders[extruder_idx], nozzle_assignments[extruder_idx]);
+
     if (!begin_batch_calibration_project(_L("Batch Flow Ratio Calibration")))
         return false;
 
     boost::filesystem::path model_path = boost::filesystem::path(Slic3r::resources_dir()) / "calib" / "filament_flow";
+    const size_t expected_member_count = is_linear ? (pass == 1 ? 11 : 16) : (pass == 1 ? 9 : 10);
     if (is_linear)
         model_path /= (pass == 1 ? "Orca-LinearFlow.3mf" : "Orca-LinearFlow_fine.3mf");
     else
         model_path /= (pass == 1 ? "flowrate-test-pass1.3mf" : "flowrate-test-pass2.3mf");
 
-    std::map<const ModelObject*, double> group_flow_ratios;
-    for (const int extruder : extruders) {
+    std::vector<CalibrationObjectGroup> flow_object_groups;
+    flow_object_groups.reserve(ordered_extruders.size());
+    for (const int extruder : ordered_extruders) {
         const size_t first_object = model().objects.size();
         if (!add_model(false, model_path.string())) {
             error_message = _L("Failed to load the Flow Ratio calibration model.");
@@ -17240,6 +17399,7 @@ bool Plater::calib_batch_flowrate(const std::vector<int>& extruders, bool is_lin
         }
 
         const double filament_flow_ratio = flow_ratios->get_at(extruder);
+        std::map<const ModelObject*, double> group_flow_ratios;
         for (size_t object_idx = first_object; object_idx < model().objects.size(); ++object_idx) {
             ModelObject* object = model().objects[object_idx];
             object->config.set("extruder", extruder + 1);
@@ -17247,15 +17407,38 @@ bool Plater::calib_batch_flowrate(const std::vector<int>& extruders, bool is_lin
         }
 
         adjust_settings_for_flowrate_calib(model().objects, is_linear, pass, pattern, &group_flow_ratios);
-        for (size_t object_idx = first_object; object_idx < model().objects.size(); ++object_idx) {
-            ModelObject* object = model().objects[object_idx];
-            object->name = "Batch Flow Ratio E" + std::to_string(extruder + 1) + " " + object->name;
+
+        std::vector<ModelObject*> members(model().objects.begin() + first_object, model().objects.end());
+        std::string assembly_error;
+        ModelObject* assembly = build_flow_ratio_calibration_assembly(
+            model(), members, extruder + 1, expected_member_count, assembly_error);
+        if (assembly == nullptr) {
+            error_message = from_u8(assembly_error);
+            return false;
         }
+
+        for (size_t obj_idx = first_object + members.size(); obj_idx > first_object; --obj_idx) {
+            get_partplate_list().notify_instance_removed(static_cast<int>(obj_idx - 1), -1);
+            sidebar().obj_list()->delete_object_from_list(obj_idx - 1);
+        }
+        sidebar().obj_list()->add_object_to_list(first_object);
+        object_list_changed();
+
+        flow_object_groups.push_back({first_object, 1, nozzle_by_extruder.at(extruder)});
+    }
+
+    auto& print_config = wxGetApp().preset_bundle->prints.get_edited_preset().config;
+    print_config.set_key_value("skirt_loops", new ConfigOptionInt(0));
+    print_config.set_key_value("enable_prime_tower", new ConfigOptionBool(false));
+    for (const CalibrationObjectGroup& object_group : flow_object_groups) {
+        ModelObject* assembly = model().objects[object_group.first_object];
+        assembly->config.set_key_value("brim_type", new ConfigOptionEnum<BrimType>(btNoBrim));
+        assembly->config.set_key_value("brim_width", new ConfigOptionFloat(0.0));
     }
 
     wxGetApp().get_tab(Preset::TYPE_PRINTER)->reload_config();
     wxGetApp().preset_bundle->printers.get_edited_preset().config.set_key_value("resonance_avoidance", new ConfigOptionBool{false});
-    return finish_batch_calibration(*this, model(), _L("Batch Flow Ratio Calibration"), error_message);
+    return finish_batch_calibration(*this, model(), flow_object_groups, error_message);
 }
 
 bool Plater::calib_batch_temperature(const std::vector<Calib_Params>& tower_params, wxString& error_message)
@@ -17270,6 +17453,7 @@ bool Plater::calib_batch_temperature(const std::vector<Calib_Params>& tower_para
     const PresetBundle* preset_bundle = wxGetApp().preset_bundle;
     const auto* nozzle_diameters = full_config.option<ConfigOptionFloats>("nozzle_diameter");
     const auto* nozzle_temperatures = full_config.option<ConfigOptionInts>("nozzle_temperature");
+    const auto* filament_map_option = full_config.option<ConfigOptionInts>("filament_map");
     if (nozzle_diameters == nullptr || nozzle_temperatures == nullptr) {
         error_message = _L("No printer profile is loaded.");
         return false;
@@ -17281,16 +17465,23 @@ bool Plater::calib_batch_temperature(const std::vector<Calib_Params>& tower_para
 
     std::vector<double> selected_nozzle_diameters;
     selected_nozzle_diameters.reserve(tower_params.size());
+    std::vector<int> filament_map;
+    if (filament_map_option != nullptr)
+        filament_map = filament_map_option->values;
+    const bool is_bbl_vendor = wxGetApp().preset_bundle->is_bbl_vendor();
+
     for (const Calib_Params& params : tower_params) {
+        const std::optional<int> physical_nozzle_index = batch_filament_physical_nozzle_index(
+            params.extruder_id, filament_map, nozzle_diameters->values.size(), is_bbl_vendor);
         if (params.mode != CalibMode::Calib_Temp_Tower || batch_selected_filament_preset(*preset_bundle, params.extruder_id) == nullptr ||
-            params.extruder_id >= static_cast<int>(nozzle_diameters->values.size()) || nozzle_diameters->get_at(params.extruder_id) <= 0.0 ||
+            !physical_nozzle_index.has_value() || nozzle_diameters->get_at(*physical_nozzle_index) <= 0.0 ||
             params.extruder_id >= static_cast<int>(nozzle_temperatures->values.size()) ||
             nozzle_temperatures->get_at(params.extruder_id) <= 0 ||
             !valid_batch_temperature_tower(static_cast<int>(params.start), static_cast<int>(params.end))) {
             error_message = _L("Please select valid filaments and Temperature Tower settings.");
             return false;
         }
-        selected_nozzle_diameters.push_back(nozzle_diameters->get_at(params.extruder_id));
+        selected_nozzle_diameters.push_back(nozzle_diameters->get_at(*physical_nozzle_index));
     }
     if (!batch_nozzle_diameters_match(selected_nozzle_diameters)) {
         error_message = _L("Please select filaments with the same nozzle diameter.");
@@ -17368,7 +17559,7 @@ bool Plater::calib_batch_temperature(const std::vector<Calib_Params>& tower_para
         print->set_object_calib_params(*model().objects[tower_idx], tower_params[tower_idx]);
     }
 
-    return finish_batch_calibration(*this, model(), _L("Batch Temperature Tower Calibration"), error_message);
+    return finish_batch_calibration(*this, model(), {}, error_message);
 }
 
 

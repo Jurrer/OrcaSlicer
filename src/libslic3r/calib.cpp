@@ -7,6 +7,7 @@
 #include "GCode/GCodeProcessor.hpp"
 #include "CustomGCode.hpp"
 #include "Model.hpp"
+#include "ClipperUtils.hpp"
 #include "GCode.hpp"
 #include "PrintConfig.hpp"
 #include <algorithm>
@@ -23,29 +24,56 @@
 #include <utility>
 #include <locale>
 #include "clonable_ptr.hpp"
+#include <set>
 
 namespace Slic3r {
 
-std::optional<double> flow_ratio_calibration_print_flow_ratio(const ModelObject &object, double filament_flow_ratio, bool linear)
+namespace
 {
-    const std::string &object_name = object.name;
-    if (!std::isfinite(filament_flow_ratio) || filament_flow_ratio <= 0.0 || object_name.size() <= 9 || object_name.compare(0, 9, "flowrate_") != 0)
+
+std::optional<double> flow_ratio_calibration_name_modifier(const std::string &name)
+{
+    if (name.size() <= 9 || name.compare(0, 9, "flowrate_") != 0)
         return std::nullopt;
 
-    std::string modifier = object_name.substr(9);
+    std::string modifier = name.substr(9);
     if (!modifier.empty() && modifier.front() == 'm')
         modifier.front() = '-';
 
     std::istringstream stream(modifier);
     stream.imbue(std::locale::classic());
     double modifier_value = 0.0;
-    if (!(stream >> modifier_value) || stream.peek() != std::char_traits<char>::eof())
+    if (!(stream >> modifier_value) || stream.peek() != std::char_traits<char>::eof() || !std::isfinite(modifier_value))
+        return std::nullopt;
+
+    return modifier_value;
+}
+
+}
+
+std::optional<double> flow_ratio_calibration_print_flow_ratio(const std::string &name, double filament_flow_ratio, bool linear)
+{
+    if (!std::isfinite(filament_flow_ratio) || filament_flow_ratio <= 0.0)
+        return std::nullopt;
+
+    const std::optional<double> modifier = flow_ratio_calibration_name_modifier(name);
+    if (!modifier.has_value())
         return std::nullopt;
 
     if (linear)
-        return (filament_flow_ratio + modifier_value) / filament_flow_ratio;
+        return (filament_flow_ratio + *modifier) / filament_flow_ratio;
 
-    return 1.0 + modifier_value / 100.0;
+    return 1.0 + *modifier / 100.0;
+}
+
+std::optional<double> flow_ratio_calibration_print_flow_ratio(const ModelObject &object, double filament_flow_ratio, bool linear)
+{
+    return flow_ratio_calibration_print_flow_ratio(object.name, filament_flow_ratio, linear);
+}
+
+std::optional<double> flow_ratio_calibration_print_flow_ratio(const ModelVolume &volume, double filament_flow_ratio, bool linear)
+{
+    return flow_ratio_calibration_print_flow_ratio(volume.name, filament_flow_ratio, linear);
 }
 
 std::pair<int, int> batch_temperature_tower_defaults(const std::string &filament_type)
@@ -68,6 +96,28 @@ bool valid_batch_temperature_tower(int start_temperature, int end_temperature)
     return start_temperature <= 500 && end_temperature >= 155 && start_temperature > end_temperature;
 }
 
+std::optional<int> batch_filament_physical_nozzle_index(
+    int filament_id, const std::vector<int> &filament_map, size_t nozzle_count, bool is_bbl_machine)
+{
+    if (filament_id < 0 || nozzle_count == 0)
+        return std::nullopt;
+
+    if (!is_bbl_machine)
+        return filament_id < static_cast<int>(nozzle_count) ? std::optional<int>(filament_id) : std::nullopt;
+
+    if (nozzle_count == 1)
+        return 0;
+
+    if (filament_id >= static_cast<int>(filament_map.size()))
+        return std::nullopt;
+
+    const int physical_nozzle_index = filament_map[filament_id] - 1;
+    if (physical_nozzle_index < 0 || physical_nozzle_index >= static_cast<int>(nozzle_count))
+        return std::nullopt;
+
+    return physical_nozzle_index;
+}
+
 bool batch_nozzle_diameters_match(const std::vector<double> &nozzle_diameters)
 {
     if (nozzle_diameters.empty())
@@ -77,6 +127,324 @@ bool batch_nozzle_diameters_match(const std::vector<double> &nozzle_diameters)
     return std::all_of(nozzle_diameters.begin(), nozzle_diameters.end(), [first_nozzle_diameter](double nozzle_diameter) {
         return std::isfinite(nozzle_diameter) && nozzle_diameter > 0.0 && std::abs(nozzle_diameter - first_nozzle_diameter) < EPSILON;
     });
+}
+
+namespace
+{
+
+bool polygon_contains_polygon(const Polygon &polygon, const Polygon &container)
+{
+    const double polygon_area = std::abs(polygon.area());
+    const double contained_area = std::abs(area(intersection(polygon, container)));
+    return std::abs(polygon_area - contained_area) <= std::max(1.0, polygon_area * 1e-6);
+}
+
+bool polygons_clear_each_other(const Polygon &first, const Polygon &second, coord_t clearance)
+{
+    const Polygons first_inflated = offset(first, static_cast<float>(clearance / 2));
+    const Polygons second_inflated = offset(second, static_cast<float>(clearance / 2));
+    const Polygons overlap = intersection(first_inflated, second_inflated);
+    return std::abs(area(overlap)) <= 1.0;
+}
+
+Point printable_bed_center(const Polygon &bed)
+{
+    const Point area_centroid = bed.centroid();
+    if (bed.contains(area_centroid))
+        return area_centroid;
+
+    const Point bounding_box_center = bed.bounding_box().center();
+    if (bed.contains(bounding_box_center))
+        return bounding_box_center;
+
+    return bed.points.front();
+}
+
+std::optional<std::vector<CalibrationAssemblyPlacement>> arrange_assemblies_on_single_area(
+    const std::vector<Polygon> &assembly_hulls, const Polygon &bed)
+{
+    const size_t row_count = assembly_hulls.size() <= 2 ? assembly_hulls.size() : (assembly_hulls.size() + 1) / 2;
+    const size_t column_count = assembly_hulls.size() <= 2 ? 1 : 2;
+    const std::vector<std::vector<double>> rotation_candidates(1, std::vector<double>(assembly_hulls.size(), 0.0));
+
+    const coord_t clearance = scaled<coord_t>(4.0);
+    const Point bed_center = printable_bed_center(bed);
+
+    for (const std::vector<double> &rotations : rotation_candidates) {
+        std::vector<Polygon> rotated_hulls(assembly_hulls.size());
+        std::vector<BoundingBox> rotated_boxes(assembly_hulls.size());
+        for (size_t assembly_idx = 0; assembly_idx < assembly_hulls.size(); ++assembly_idx) {
+            rotated_hulls[assembly_idx] = assembly_hulls[assembly_idx];
+            rotated_hulls[assembly_idx].rotate(rotations[assembly_idx]);
+            rotated_boxes[assembly_idx] = rotated_hulls[assembly_idx].bounding_box();
+        }
+
+        std::vector<coord_t> column_widths(column_count, 0);
+        std::vector<coord_t> row_heights(row_count, 0);
+        for (size_t assembly_idx = 0; assembly_idx < assembly_hulls.size(); ++assembly_idx) {
+            const BoundingBox &box = rotated_boxes[assembly_idx];
+            const size_t column = assembly_idx / row_count;
+            const size_t row = assembly_idx % row_count;
+            column_widths[column] = std::max(column_widths[column], box.size().x());
+            row_heights[row] = std::max(row_heights[row], box.size().y());
+        }
+
+        coord_t total_width = static_cast<coord_t>(column_count - 1) * clearance;
+        coord_t total_height = static_cast<coord_t>(row_count - 1) * clearance;
+        for (const coord_t width : column_widths)
+            total_width += width;
+        for (const coord_t height : row_heights)
+            total_height += height;
+
+        const Point origin(
+            bed_center.x() - total_width / 2,
+            bed_center.y() - total_height / 2);
+
+        std::vector<coord_t> x_offsets(column_count, origin.x());
+        std::vector<coord_t> y_offsets(row_count, origin.y());
+        for (size_t column = 1; column < column_count; ++column)
+            x_offsets[column] = x_offsets[column - 1] + column_widths[column - 1] + clearance;
+        for (size_t row = 1; row < row_count; ++row)
+            y_offsets[row] = y_offsets[row - 1] + row_heights[row - 1] + clearance;
+
+        std::vector<CalibrationAssemblyPlacement> placements(assembly_hulls.size());
+        bool fits_bed = true;
+        for (size_t assembly_idx = 0; assembly_idx < assembly_hulls.size() && fits_bed; ++assembly_idx) {
+            const BoundingBox &box = rotated_boxes[assembly_idx];
+            const size_t column = assembly_idx / row_count;
+            const size_t row = assembly_idx % row_count;
+            const Point center(
+                x_offsets[column] + box.size().x() / 2,
+                y_offsets[row] + box.size().y() / 2);
+            const Point translation = center - box.center();
+            Polygon placed_hull = rotated_hulls[assembly_idx];
+            placed_hull.translate(translation);
+            if (!polygon_contains_polygon(placed_hull, bed)) {
+                fits_bed = false;
+                break;
+            }
+            placements[assembly_idx] = {
+                {unscale<double>(center.x()), unscale<double>(center.y())},
+                rotations[assembly_idx],
+            };
+        }
+
+        if (fits_bed)
+            return placements;
+    }
+
+    return std::nullopt;
+}
+
+}
+
+std::optional<std::vector<CalibrationAssemblyPlacement>> arrange_flow_ratio_calibration_assemblies(
+    const std::vector<Polygon> &assembly_hulls, const Points &bed_points)
+{
+    if (assembly_hulls.empty())
+        return std::vector<CalibrationAssemblyPlacement>{};
+    if (bed_points.size() < 3)
+        return std::nullopt;
+    for (const Polygon &hull : assembly_hulls) {
+        if (hull.points.empty())
+            return std::nullopt;
+    }
+
+    const Polygon bed(bed_points);
+    return arrange_assemblies_on_single_area(assembly_hulls, bed);
+}
+
+std::optional<std::vector<CalibrationAssemblyPlacement>> arrange_flow_ratio_calibration_assemblies(
+    const std::vector<Polygon> &assembly_hulls, const std::vector<CalibrationNozzle> &nozzle_assignments,
+    const Polygon &left_printable_area, const Polygon &right_printable_area)
+{
+    if (assembly_hulls.empty())
+        return std::vector<CalibrationAssemblyPlacement>{};
+    if (nozzle_assignments.size() != assembly_hulls.size() ||
+        left_printable_area.points.size() < 3 || right_printable_area.points.size() < 3)
+        return std::nullopt;
+    for (const Polygon &hull : assembly_hulls) {
+        if (hull.points.empty())
+            return std::nullopt;
+    }
+
+    const bool all_left = std::all_of(
+        nozzle_assignments.begin(), nozzle_assignments.end(), [](CalibrationNozzle nozzle) {
+            return nozzle == CalibrationNozzle::Left;
+        });
+    const bool all_right = std::all_of(
+        nozzle_assignments.begin(), nozzle_assignments.end(), [](CalibrationNozzle nozzle) {
+            return nozzle == CalibrationNozzle::Right;
+        });
+    if (all_left)
+        return arrange_assemblies_on_single_area(assembly_hulls, left_printable_area);
+    if (all_right)
+        return arrange_assemblies_on_single_area(assembly_hulls, right_printable_area);
+
+    std::vector<size_t> placement_order;
+    placement_order.reserve(assembly_hulls.size());
+    for (size_t assembly_idx = 0; assembly_idx < assembly_hulls.size(); ++assembly_idx)
+        if (nozzle_assignments[assembly_idx] == CalibrationNozzle::Right)
+            placement_order.push_back(assembly_idx);
+    for (size_t assembly_idx = 0; assembly_idx < assembly_hulls.size(); ++assembly_idx)
+        if (nozzle_assignments[assembly_idx] == CalibrationNozzle::Left)
+            placement_order.push_back(assembly_idx);
+
+    const coord_t clearance = scaled<coord_t>(4.0);
+    const coord_t step = scaled<coord_t>(1.0);
+    std::vector<CalibrationAssemblyPlacement> placements(assembly_hulls.size());
+    std::vector<Polygon> placed_hulls(assembly_hulls.size());
+    std::vector<bool> placed(assembly_hulls.size(), false);
+
+    for (const size_t assembly_idx : placement_order) {
+        const Polygon &hull = assembly_hulls[assembly_idx];
+        const Polygon &nozzle_area = nozzle_assignments[assembly_idx] == CalibrationNozzle::Left ?
+            left_printable_area : right_printable_area;
+        const BoundingBox hull_box = hull.bounding_box();
+        const BoundingBox area_box = nozzle_area.bounding_box();
+        const coord_t x_start = area_box.min.x() + hull_box.size().x() / 2;
+        const coord_t x_end = area_box.max.x() - hull_box.size().x() / 2;
+        const coord_t y_start = area_box.min.y() + hull_box.size().y() / 2;
+        const coord_t y_end = area_box.max.y() - hull_box.size().y() / 2;
+        if (x_start > x_end || y_start > y_end)
+            return std::nullopt;
+
+        bool placed_current = false;
+        for (coord_t y = y_start; y <= y_end && !placed_current; y += step) {
+            for (coord_t x = x_start; x <= x_end && !placed_current; x += step) {
+                const Point center(x, y);
+                Polygon candidate = hull;
+                candidate.translate(center - hull_box.center());
+                if (!polygon_contains_polygon(candidate, nozzle_area))
+                    continue;
+
+                bool has_clearance = true;
+                for (size_t previous_idx = 0; previous_idx < assembly_hulls.size() && has_clearance; ++previous_idx) {
+                    if (placed[previous_idx])
+                        has_clearance = polygons_clear_each_other(candidate, placed_hulls[previous_idx], clearance);
+                }
+                if (!has_clearance)
+                    continue;
+
+                placed_hulls[assembly_idx] = candidate;
+                placed[assembly_idx] = true;
+                placements[assembly_idx] = {{unscale<double>(center.x()), unscale<double>(center.y())}, 0.0};
+                placed_current = true;
+            }
+        }
+        if (!placed_current)
+            return std::nullopt;
+    }
+
+    return placements;
+}
+
+ModelObject* build_flow_ratio_calibration_assembly(
+    Model &model, std::vector<ModelObject*> &members, int extruder, size_t expected_member_count, std::string &error)
+{
+    error.clear();
+    if (members.empty()) {
+        error = "The Flow Ratio calibration model contains no test members.";
+        return nullptr;
+    }
+    if (extruder < 1) {
+        error = "The Flow Ratio calibration extruder must be at least 1.";
+        return nullptr;
+    }
+    if (members.size() != expected_member_count) {
+        error = "The Flow Ratio calibration model contains " + std::to_string(members.size()) +
+                " test members; expected " + std::to_string(expected_member_count) + ".";
+        return nullptr;
+    }
+
+    PrintObjectConfig print_object_config;
+    PrintRegionConfig print_region_config;
+    const t_config_option_keys object_config_keys = print_object_config.keys();
+    const t_config_option_keys region_config_keys = print_region_config.keys();
+    const std::set<std::string> object_keys(object_config_keys.begin(), object_config_keys.end());
+    const std::set<std::string> region_keys(region_config_keys.begin(), region_config_keys.end());
+
+    for (const ModelObject *member : members) {
+        if (member == nullptr || std::find(model.objects.begin(), model.objects.end(), member) == model.objects.end()) {
+            error = "The Flow Ratio calibration model contains an unknown test member.";
+            return nullptr;
+        }
+        if (!flow_ratio_calibration_name_modifier(member->name).has_value()) {
+            error = "The Flow Ratio calibration model contains a malformed test member name: " + member->name;
+            return nullptr;
+        }
+        if (!member->printable || member->instances.size() != 1 || !member->instances.front()->printable) {
+            error = "The Flow Ratio calibration member " + member->name + " must have one printable instance.";
+            return nullptr;
+        }
+        if (member->volumes.size() != 1 || member->volumes.front()->type() != ModelVolumeType::MODEL_PART) {
+            error = "The Flow Ratio calibration member " + member->name + " must have one printable volume.";
+            return nullptr;
+        }
+    }
+
+    for (const ModelObject *member : members) {
+        for (const std::string &key : member->config.keys()) {
+            if (key == "extruder") {
+                if (member->config.opt_int(key) != extruder) {
+                    error = "The Flow Ratio calibration member " + member->name +
+                            " is assigned to a different extruder than the selected filament.";
+                    return nullptr;
+                }
+                continue;
+            }
+            if (object_keys.count(key) == 0 && region_keys.count(key) == 0) {
+                error = "The Flow Ratio calibration member " + member->name + " contains the unknown object setting " + key + ".";
+                return nullptr;
+            }
+        }
+    }
+
+    for (const ModelObject *member : members) {
+        for (const std::string &key : member->config.keys()) {
+            if (object_keys.count(key) == 0)
+                continue;
+
+            const ConfigOption *reference_value = member->config.option(key);
+            for (const ModelObject *other_member : members) {
+                if (other_member == member)
+                    continue;
+
+                const ConfigOption *other_value = other_member->config.option(key);
+                if (other_value == nullptr || *reference_value != *other_value) {
+                    error = "The Flow Ratio calibration members differ in the shared object setting " + key + ".";
+                    return nullptr;
+                }
+            }
+        }
+    }
+
+    ModelObject *assembly = model.add_object();
+    assembly->name = "Batch Flow Ratio E" + std::to_string(extruder);
+    assembly->config.set("extruder", extruder);
+    assembly->add_instance();
+
+    for (ModelObject *member : members) {
+        ModelVolume *volume = assembly->add_volume(*member->volumes.front());
+        volume->name = member->name;
+        volume->set_transformation(member->instances.front()->get_matrix() * member->volumes.front()->get_matrix());
+
+        for (const std::string &key : member->config.keys()) {
+            if (region_keys.count(key) != 0)
+                volume->config.set_key_value(key, member->config.option(key)->clone());
+        }
+        volume->config.set("extruder", extruder);
+    }
+
+    for (const std::string &key : members.front()->config.keys()) {
+        if (object_keys.count(key) != 0)
+            assembly->config.set_key_value(key, members.front()->config.option(key)->clone());
+    }
+
+    for (ModelObject *member : members)
+        model.delete_object(member);
+
+    return assembly;
 }
 
 // Calculate the optimal Pressure Advance speed
