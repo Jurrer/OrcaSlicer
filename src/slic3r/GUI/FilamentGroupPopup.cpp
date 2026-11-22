@@ -10,6 +10,7 @@
 #include <map>
 #include <string>
 #include <boost/log/trivial.hpp>
+#include <boost/format.hpp>
 #include <vector>
 #include <wx/utils.h>
 #include "slic3r/GUI/wxExtensions.hpp"
@@ -379,12 +380,22 @@ void FilamentGroupPopup::OnTimer(wxTimerEvent &event)
     // leaving event got triggered. So the timer is stopped first, then started
     // again, causing the popup being dismissed immediately.
     // To fix this, we check if cursor is still inside the popup window before
-    // dismissing.
+    // dismissing, and keep checking while it is: a leave event is not guaranteed
+    // to follow, and a popup left open keeps grabbing the mouse capture.
     wxPoint pos = this->ScreenToClient(wxGetMousePosition());
-    if (this->GetClientRect().Contains(pos)) return;
+    if (this->GetClientRect().Contains(pos)) {
+        StartTimer();
+        return;
+    }
 #endif
 
     Dismiss();
+}
+
+FilamentGroupPopup::~FilamentGroupPopup()
+{
+    m_timer->Stop();
+    delete m_timer;
 }
 
 void FilamentGroupPopup::Dismiss() {
@@ -405,7 +416,10 @@ void FilamentGroupPopup::OnEnterWindow(wxMouseEvent &)
     // Ignore spurious ENTER synthesized by PopupWindow::OnMouseEvent2 on macOS.
     wxPoint pos = this->ScreenToClient(wxGetMousePosition());
     if (!this->GetClientRect().Contains(pos)) return;
+    // On macOS the timer keeps running instead, and OnTimer closes the popup once the cursor has left it.
+#ifndef __APPLE__
     ResetTimer();
+#endif
 }
 
 void FilamentGroupPopup::UpdateButtonStatus(int hover_idx)
