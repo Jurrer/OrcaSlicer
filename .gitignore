@@ -55,3 +55,10 @@ __pycache__/
 /.test/
 docs/superpowers/
 ctest_results.xml
+src/**/CMakeFiles/
+
+# graft's local graph cache — regenerable, not committed (run `graft build`).
+/graft/
+
+# graft's local repository settings — not committed.
+/.graft/
