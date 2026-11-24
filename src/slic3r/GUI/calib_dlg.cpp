@@ -1984,6 +1984,18 @@ void FlowRateCalibrationDialog::on_dpi_changed(const wxRect& suggested_rect) {
 
 namespace {
 
+enum BatchFilamentType : int
+{
+    tPLA = 0,
+    tABS_ASA,
+    tPETG,
+    tPCTG,
+    tTPU,
+    tPA_CF,
+    tPET_CF,
+    tCustom
+};
+
 struct BatchCalibrationTemperatureRow {
     int extruder;
     int start_temperature;
